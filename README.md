@@ -360,6 +360,7 @@ data/oxford3000_*.csv       исходный словарь
 tests/                      pytest-набор (см. ниже)
 requirements.txt            зависимости
 pytest.ini                  конфигурация pytest (asyncio_mode = auto)
+.github/workflows/tests.yml CI: прогон pytest на GitHub Actions
 task.md                     техническое задание проекта
 run_bot.cmd                 запуск бота с логами в logs\ (для Планировщика заданий)
 run_bot_bg.cmd              запуск в фоне через pythonw (без окна, защита от дубля)
@@ -378,6 +379,9 @@ run_bot_bg.cmd              запуск в фоне через pythonw (без 
 `pytest.ini` включает `asyncio_mode = auto`, поэтому `async`-тесты (импорт CSV,
 репозиторий, хендлеры) работают без явных маркеров. Ожидаемый результат на
 текущем состоянии проекта: **169 passed**.
+
+Тот же набор тестов прогоняется автоматически в GitHub Actions: при push в `main`
+и в pull request, на Python 3.11 и 3.12 (`.github/workflows/tests.yml`).
 
 | Файл | Что покрыто |
 |------|-------------|
@@ -479,6 +483,10 @@ Stop-Process -Id <Id>                                # оставить один
 
 **`Ошибка: не задан BOT_TOKEN`.**
 Скопируйте `.env.example` в `.env` и укажите токен от @BotFather.
+
+**`ZoneInfoNotFoundError` при запуске на Windows.**
+В `zoneinfo` нет системной базы часовых поясов, нужен пакет `tzdata` (он уже
+указан в `requirements.txt`): выполните `pip install -r requirements.txt`.
 
 **В базе нет слов / `Файл словаря не найден`.**
 Проверьте `CSV_PATH` и наличие файла, затем выполните
