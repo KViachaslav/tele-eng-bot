@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message
 from aiogram.types import User as TgUser
+from loguru import logger
 
 import config
 import locales.ru as texts
@@ -359,6 +362,88 @@ async def test_on_show_reports_unknown_delivery(session, user, words) -> None:
 
     assert bot.edits == []
     assert bot.methods
+
+
+@contextmanager
+def captured_warnings() -> Iterator[list[str]]:
+    """Собирает предупреждения loguru — так проверяются строки про кнопки."""
+    messages: list[str] = []
+    sink_id = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
+
+
+async def test_unknown_delivery_writes_reason_to_log(session, user, words) -> None:
+    """Причина «отправки нет» попадает в лог, а не только в алерт пользователю.
+
+    Без этой строки такой случай не отличить от опечатки в кнопке: пользователю
+    показывается общий алерт «Не нашёл это слово в истории отправок».
+    """
+    bot = FakeBot()
+    answer_data = AnswerCallback(
+        answer=config.ANSWER_KNOW, word_id=words[0].id, delivery_id=999
+    )
+
+    with captured_warnings() as messages:
+        await word_actions.on_answer(
+            callback=make_callback(answer_data.pack(), bot),
+            callback_data=answer_data,
+            session=session,
+        )
+
+    log_text = "".join(messages)
+    assert "Кнопка без отправки" in log_text
+    assert "delivery_id=999" in log_text
+    assert "пользователь 1001" in log_text
+
+
+async def test_foreign_delivery_writes_reason_to_log(session, user, words) -> None:
+    """Кнопка из чужого чата (пересланное сообщение): причина в логе.
+
+    Инлайн-кнопки пересылаются вместе с сообщением, поэтому нажать карточку
+    может аккаунт, которому отправка не принадлежит.
+    """
+    other = await repository.create_user(session, telegram_id=2002)
+    foreign = await repository.create_delivery(session, other.id, words[0].id)
+    bot = FakeBot()
+    show_data = ShowCallback(word_id=words[0].id, delivery_id=foreign.id)
+
+    with captured_warnings() as messages:
+        await word_actions.on_show(
+            callback=make_callback(show_data.pack(), bot),
+            callback_data=show_data,
+            session=session,
+        )
+
+    log_text = "".join(messages)
+    assert "Кнопка от чужой отправки" in log_text
+    assert f"delivery_id={foreign.id}" in log_text
+    assert f"(user_id={other.id})" in log_text
+    assert "нажал 1001" in log_text
+    assert bot.edits == []
+
+
+async def test_mismatched_word_writes_reason_to_log(session, user, words) -> None:
+    """Слово в кнопке разошлось с журналом отправок: причина в логе."""
+    own = await repository.create_delivery(session, user.id, words[0].id)
+    bot = FakeBot()
+    answer_data = AnswerCallback(
+        answer=config.ANSWER_KNOW, word_id=words[1].id, delivery_id=own.id
+    )
+
+    with captured_warnings() as messages:
+        await word_actions.on_answer(
+            callback=make_callback(answer_data.pack(), bot),
+            callback_data=answer_data,
+            session=session,
+        )
+
+    log_text = "".join(messages)
+    assert "Кнопка от другого слова" in log_text
+    assert f"в отправке {own.id} слово {words[0].id}" in log_text
+    assert await repository.get_user_word(session, user.id, words[1].id) is None
 
 
 # ---------------------------------------------------------------------------

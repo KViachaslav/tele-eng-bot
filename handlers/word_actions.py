@@ -45,11 +45,46 @@ async def _fetch_delivery(
     word_id: int,
     delivery_id: int,
 ) -> DeliveryLog | None:
-    """Отправка, если она существует и принадлежит этому пользователю."""
+    """Отправка, если она существует и принадлежит этому пользователю.
+
+    ``callback_data`` собирается из ``delivery_log`` в момент отправки карточки,
+    поэтому запись обязана найтись: строки из этого журнала нигде не удаляются.
+    Если её нет, причина почти всегда внешняя — базу пересоздали или перенесли
+    (например, скопировали ``bot.db`` без журнала ``bot.db-wal``, где лежали
+    свежие отправки) либо кнопку нажал чужой аккаунт (пересланное сообщение).
+    Причина пишется в лог: пользователю достаётся только общий алерт, и без
+    этой строки такой случай не отличить от опечатки в кнопке.
+
+    :return: запись журнала отправок или ``None`` — тогда хендлер отвечает
+        пользователю подсказкой «отправь /word».
+    """
     delivery_log = await repository.get_delivery(session, delivery_id)
-    if delivery_log is None or delivery_log.user_id != user.id:
+    if delivery_log is None:
+        logger.warning(
+            "Кнопка без отправки: delivery_id={} нет в delivery_log "
+            "(пользователь {}, слово {}). База пересоздана или перенесена без WAL?",
+            delivery_id,
+            user.telegram_id,
+            word_id,
+        )
+        return None
+    if delivery_log.user_id != user.id:
+        logger.warning(
+            "Кнопка от чужой отправки: delivery_id={} принадлежит другому "
+            "пользователю (user_id={}), нажал {} (слово {})",
+            delivery_id,
+            delivery_log.user_id,
+            user.telegram_id,
+            word_id,
+        )
         return None
     if delivery_log.word_id != word_id:
+        logger.warning(
+            "Кнопка от другого слова: в отправке {} слово {}, в кнопке {}",
+            delivery_id,
+            delivery_log.word_id,
+            word_id,
+        )
         return None
     return delivery_log
 
