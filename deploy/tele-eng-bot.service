@@ -1,0 +1,43 @@
+# Юнит systemd для бота на Linux-сервере.
+#
+# Установка — см. README, раздел «Развёртывание на сервере (Linux, systemd)».
+# Файл лежит в репозитории как шаблон: deploy/install.sh подставляет в него
+# каталог проекта и имя пользователя (@PROJECT_DIR@ / @RUN_USER@).
+#
+# Ручная установка:
+#   sudo sed -e 's|@PROJECT_DIR@|/opt/tele_eng|g' -e 's|@RUN_USER@|teleeng|g' \
+#     deploy/tele-eng-bot.service > /etc/systemd/system/tele-eng-bot.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tele-eng-bot
+
+[Unit]
+Description=Telegram bot for learning English words (tele_eng)
+Documentation=file:@PROJECT_DIR@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_USER@
+WorkingDirectory=@PROJECT_DIR@
+# Настройки бот читает сам из .env (переменные окружения имеют приоритет)
+EnvironmentFile=@PROJECT_DIR@/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=@PROJECT_DIR@/.venv/bin/python @PROJECT_DIR@/main.py
+
+# Перезапуск после падения; SIGINT — тот же путь остановки, что и Ctrl+C.
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Только один экземпляр бота: второй процесс с тем же токеном отбирает
+# getUpdates (TelegramConflictError). Не запускайте бота ещё и локально.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=@PROJECT_DIR@
+
+[Install]
+WantedBy=multi-user.target

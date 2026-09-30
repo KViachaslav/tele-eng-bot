@@ -14,6 +14,7 @@ Oxford 3000 по расписанию в вашем часовом поясе, �
 - [Возможности](#возможности)
 - [Требования](#требования)
 - [Быстрый старт](#быстрый-старт)
+- [Развёртывание на сервере](#развёртывание-на-сервере-linux-systemd)
 - [Настройки `.env`](#настройки-env)
 - [Словарь и импорт CSV](#словарь-и-импорт-csv)
 - [Команды бота](#команды-бота)
@@ -66,7 +67,8 @@ Oxford 3000 по расписанию в вашем часовом поясе, �
 
 - Python 3.11+
 - Токен бота от [@BotFather](https://t.me/BotFather)
-- Windows или Linux (запуск вручную, без сервисных обёрток)
+- Windows или Linux (вручную; автозапуск — Планировщик заданий Windows или
+  `systemd` на Linux, см. [развёртывание](#развёртывание-на-сервере-linux-systemd))
 
 Зависимости (`requirements.txt`): `aiogram`, `aiosqlite`, `SQLAlchemy[asyncio]`,
 `APScheduler`, `pydantic-settings`, `loguru`; для тестов — `pytest`,
@@ -132,6 +134,109 @@ schtasks /create /f /tn tele_eng_bot_bg /tr "C:\project\tele_eng\run_bot_bg.cmd"
 Запускайте **только один** экземпляр бота: второй процесс с тем же токеном
 начинает отбирать `getUpdates`, в логах появляется `TelegramConflictError`, и бот
 перестаёт отвечать на команды.
+
+### Развёртывание на сервере (Linux, systemd)
+
+Бот работает через long polling: домен, SSL-сертификат и открытые порты не нужны —
+достаточно исходящего доступа в интернет. На VPS (Ubuntu 22.04+ / Debian 12+) он
+ставится как сервис `systemd`, база и `.env` лежат рядом с проектом, поэтому Docker
+не требуется. Хватает 1 vCPU / 512 МБ RAM / 1 ГБ диска.
+
+```bash
+# 1. Пакеты и код (приватный репозиторий — по токену или SSH-ключу сервера)
+sudo apt update && sudo apt install -y git python3 python3-venv
+sudo git clone https://github.com/USERNAME/tele-eng-bot.git /opt/tele_eng
+sudo chown -R "$USER":"$USER" /opt/tele_eng
+
+# 2. Установка: пользователь teleeng, .venv, зависимости, .env, юнит systemd
+cd /opt/tele_eng
+sudo bash deploy/install.sh
+
+# 3. Токен: пока в .env нет реального BOT_TOKEN, сервис не запускается
+sudo nano /opt/tele_eng/.env          # BOT_TOKEN=<токен от @BotFather>
+sudo systemctl start tele-eng-bot
+```
+
+`deploy/install.sh` создаёт системного пользователя (`teleeng`), отдаёт ему каталог
+проекта, ставит зависимости из `requirements.txt`, готовит `.env` из шаблона,
+подставляет реальные пути в `deploy/tele-eng-bot.service` и включает автозапуск.
+Имена переопределяются переменными окружения:
+`sudo RUN_USER=mybot SERVICE_NAME=mybot bash deploy/install.sh`.
+
+#### Проверка состояния и логи
+
+```bash
+systemctl status tele-eng-bot          # активен ли сервис
+journalctl -u tele-eng-bot -f          # живой поток логов
+journalctl -u tele-eng-bot -n 100      # последние 100 строк
+tail -f /opt/tele_eng/logs/bot.log     # файл логов (LOG_FILE в .env)
+```
+
+При падении сервис поднимается через 10 секунд (`Restart=always`, `RestartSec=10`),
+после перезагрузки сервера стартует сам (`systemctl enable`). Расписания
+пользователей восстанавливаются из базы при старте
+(`SchedulerService.restore_all`), поэтому перезапуск не сбивает рассылку, а
+пропущенные во время простоя слоты «задним числом» не догоняются
+(`misfire_grace_time`).
+
+#### Ручная установка юнита (если не используете `deploy/install.sh`)
+
+```bash
+sudo useradd --system --home-dir /opt/tele_eng --shell /usr/sbin/nologin teleeng
+sudo chown -R teleeng:teleeng /opt/tele_eng
+sudo install -d -o teleeng -g teleeng /opt/tele_eng/logs
+sudo -u teleeng python3 -m venv /opt/tele_eng/.venv
+sudo -u teleeng /opt/tele_eng/.venv/bin/pip install -r /opt/tele_eng/requirements.txt
+
+sudo sed -e 's|@PROJECT_DIR@|/opt/tele_eng|g' -e 's|@RUN_USER@|teleeng|g' \
+    /opt/tele_eng/deploy/tele-eng-bot.service \
+    | sudo tee /etc/systemd/system/tele-eng-bot.service > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now tele-eng-bot
+```
+
+`.env` бот читает сам (`config.Settings`), а относительные `DB_PATH`, `CSV_PATH` и
+`LOG_FILE` считаются от каталога проекта, поэтому `bot.db` и `logs/` можно
+оставить рядом с кодом (каталогу `logs/` нужны права на запись для сервисного
+пользователя). В юните обязаны быть подставлены реальные пути: строки
+`@PROJECT_DIR@` / `@RUN_USER@` — это заготовки для `sed`, а не готовые значения.
+
+#### Обновление версии на сервере
+
+```bash
+cd /opt/tele_eng
+sudo systemctl stop tele-eng-bot
+sudo -u teleeng git pull
+sudo -u teleeng .venv/bin/pip install -r requirements.txt   # если менялись зависимости
+sudo systemctl start tele-eng-bot
+```
+
+Схему базы бот обновляет сам при старте (`db/migrations.py`), отдельные миграции
+запускать не нужно. Словарь из `data/*.csv` повторно не импортируется — импорт
+идёт только если таблица `words` пуста.
+
+#### Бэкап, перенос базы и удаление сервиса
+
+База — один файл SQLite в режиме WAL, поэтому копируйте её либо при остановленном
+сервисе, либо штатным средством SQLite:
+
+```bash
+sudo systemctl stop tele-eng-bot
+sudo cp /opt/tele_eng/bot.db /root/bot-$(date +%F).db
+
+# консистентная копия без остановки бота
+sudo -u teleeng python3 -c "import sqlite3; sqlite3.connect('/opt/tele_eng/bot.db').execute(\"VACUUM INTO '/opt/tele_eng/backup.db'\")"
+```
+
+Переезд на другой сервер: скопируйте `bot.db` и `.env` в каталог нового проекта и
+запустите сервис. **Остановите бота на старом сервере** — два процесса с одним
+токеном дают `TelegramConflictError`.
+
+```bash
+sudo systemctl disable --now tele-eng-bot     # остановить и убрать из автозапуска
+sudo rm /etc/systemd/system/tele-eng-bot.service
+sudo systemctl daemon-reload
+```
 
 ---
 
@@ -364,6 +469,8 @@ pytest.ini                  конфигурация pytest (asyncio_mode = auto
 task.md                     техническое задание проекта
 run_bot.cmd                 запуск бота с логами в logs\ (для Планировщика заданий)
 run_bot_bg.cmd              запуск в фоне через pythonw (без окна, защита от дубля)
+deploy/install.sh           установка на Linux-сервер: пользователь, venv, systemd
+deploy/tele-eng-bot.service шаблон юнита systemd (пути подставляет install.sh)
 .env.example                шаблон настроек
 ```
 
@@ -424,6 +531,16 @@ Stop-Process -Id <Id>                                # оставить один
 Проверить, кто реально держит polling: параллельный запрос
 `https://api.telegram.org/bot<TOKEN>/getUpdates` вернёт `409 Conflict`, если бот
 работает, и обычный JSON — если ни один процесс апдейты не забирает.
+
+```bash
+systemctl status tele-eng-bot     # Linux: этот сервис должен быть единственным
+pgrep -af main.py                 # лишние процессы бота на сервере
+```
+
+Если бот запущен и локально, и на сервере с одним токеном, оставьте один
+экземпляр: `sudo systemctl stop tele-eng-bot` на сервере либо остановка локального
+процесса. На сервере сервис тоже должен быть один — не запускайте
+`python main.py` руками параллельно с юнитом `systemd`.
 
 **Бот запустился, но слова не приходят.**
 Проверьте `/settings`: окно рассылки, число слов и часовой пояс; слоты идут по
