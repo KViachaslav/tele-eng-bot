@@ -1,0 +1,10 @@
+aiogram>=3.13,<4
+aiosqlite>=0.20
+SQLAlchemy[asyncio]>=2.0
+APScheduler>=3.10,<4
+pydantic-settings>=2.4
+loguru>=0.7
+
+# dev / tests
+pytest>=8.0
+pytest-asyncio>=0.24
