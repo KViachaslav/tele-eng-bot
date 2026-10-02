@@ -2,7 +2,8 @@
 
 Единый источник формата ``callback_data`` для клавиатур и фильтров хендлеров:
 ``reg:<action>:<value>``, ``settings:<action>:<value>``,
-``show:<word_id>:<delivery_id>``, ``answer:<answer>:<word_id>:<delivery_id>``.
+``show:<word_id>:<delivery_id>``, ``answer:<answer>:<word_id>:<delivery_id>``,
+``audio:<accent>:<word_id>:<delivery_id>``.
 """
 from __future__ import annotations
 
@@ -38,3 +39,12 @@ class AnswerCallback(CallbackData, prefix=config.CALLBACK_ANSWER):
     answer: str
     word_id: int
     delivery_id: int
+
+
+class AudioCallback(CallbackData, prefix=config.CALLBACK_AUDIO):
+    """Кнопки озвучки «🔊 🇬🇧 UK» / «🔊 🇺🇸 US»: озвучка слова из карточки."""
+
+    word_id: int
+    delivery_id: int
+    #: Акцент, который запросил пользователь (``uk`` / ``us``).
+    accent: str

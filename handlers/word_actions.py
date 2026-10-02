@@ -1,8 +1,10 @@
-"""Слова: команда ``/word``, показ перевода и ответы «Знаю» / «Не знаю».
+"""Слова: команда ``/word``, показ перевода, озвучка и ответы «Знаю» / «Не знаю».
 
 Ответ пользователя меняет состояние слова в SRS (:mod:`services.srs`) и
 фиксируется в ``delivery_log``; после ответа инлайн-кнопки у сообщения убираются,
-чтобы повторный клик не изменил статистику.
+чтобы повторный клик не изменил статистику. Кнопки озвучки «🔊 🇬🇧 UK» и
+«🔊 🇺🇸 US» только отправляют mp3 из ``data/<акцент>`` (:mod:`services.audio`) —
+на прогресс они не влияют.
 """
 from __future__ import annotations
 
@@ -16,9 +18,9 @@ import locales.ru as texts
 from db import repository
 from db.models import DeliveryLog, User, Word, utcnow
 from handlers import common
-from keyboards.callbacks import AnswerCallback, ShowCallback
+from keyboards.callbacks import AnswerCallback, AudioCallback, ShowCallback
 from keyboards.inline import answer_keyboard
-from services import delivery, srs
+from services import audio, delivery, srs
 from services.message_builder import build_refresh_card, build_word_card, with_answer_result
 
 router = Router(name="word_actions")
@@ -53,19 +55,26 @@ async def _fetch_delivery(
     (например, скопировали ``bot.db`` без журнала ``bot.db-wal``, где лежали
     свежие отправки) либо кнопку нажал чужой аккаунт (пересланное сообщение).
     Причина пишется в лог: пользователю достаётся только общий алерт, и без
-    этой строки такой случай не отличить от опечатки в кнопке.
+    этой строки такой случай не отличить от опечатки в кнопке. В строке есть
+    размер журнала и путь к базе: если ``delivery_id`` больше максимального
+    id в журнале, работает не та база (свежая или без журнала WAL).
 
     :return: запись журнала отправок или ``None`` — тогда хендлер отвечает
         пользователю подсказкой «отправь /word».
     """
     delivery_log = await repository.get_delivery(session, delivery_id)
     if delivery_log is None:
+        stats = await repository.get_delivery_log_stats(session)
         logger.warning(
             "Кнопка без отправки: delivery_id={} нет в delivery_log "
-            "(пользователь {}, слово {}). База пересоздана или перенесена без WAL?",
+            "(пользователь {}, слово {}). В журнале {} записей, максимальный id={} "
+            "(база {}). База пересоздана или перенесена без WAL?",
             delivery_id,
             user.telegram_id,
             word_id,
+            stats.count,
+            stats.max_id,
+            config.get_settings().database_path,
         )
         return None
     if delivery_log.user_id != user.id:
@@ -146,6 +155,51 @@ async def on_show(
         card,
         answer_keyboard(delivery_log.word_id, delivery_log.id),
         parse_mode=config.PARSE_MODE,
+    )
+    await callback.answer()
+
+
+@router.callback_query(AudioCallback.filter())
+async def on_audio(
+    callback: CallbackQuery,
+    callback_data: AudioCallback,
+    session: AsyncSession,
+) -> None:
+    """Отправляет озвучку слова по кнопкам «🔊 🇬🇧 UK» и «🔊 🇺🇸 US».
+
+    Акцент приходит в ``callback_data`` кнопки, файл ищется в ``data/<акцент>``
+    (см. :mod:`services.audio`): озвучен не весь словарь, поэтому для слова без
+    файла приходит алерт, а сообщение с карточкой не меняется — ответ на слово
+    по-прежнему можно дать.
+    """
+    user = await common.load_user_from_callback(session, callback)
+    if user is None:
+        return
+
+    delivery_log = await _fetch_delivery(
+        session, user, callback_data.word_id, callback_data.delivery_id
+    )
+    if delivery_log is None:
+        await callback.answer(texts.render_delivery_not_found(), show_alert=True)
+        return
+
+    word = delivery_log.word.word
+    accent = callback_data.accent
+    path = audio.find_audio(word, accent)
+    if path is None:
+        logger.info("Озвучки {!r} для слова {!r} нет в {}", accent, word, config.AUDIO_DIR)
+        await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
+        return
+
+    if not await audio.send_word_audio(callback.message, word, path, accent):
+        await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
+        return
+
+    logger.info(
+        "Пользователю {} отправлена озвучка слова {!r} ({})",
+        user.telegram_id,
+        word,
+        accent,
     )
     await callback.answer()
 

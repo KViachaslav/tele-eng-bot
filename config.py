@@ -32,6 +32,7 @@ CALLBACK_REG = "reg"
 CALLBACK_SETTINGS = "settings"
 CALLBACK_SHOW = "show"
 CALLBACK_ANSWER = "answer"
+CALLBACK_AUDIO = "audio"
 
 # callback-действия
 ACTION_MANUAL = "manual"
@@ -59,6 +60,20 @@ REVEAL_MODES = (REVEAL_MODE_ON_BUTTON, REVEAL_MODE_SPOILER)
 ANSWER_KNOW = "know"
 ANSWER_DONT_KNOW = "dont_know"
 ANSWERS = (ANSWER_KNOW, ANSWER_DONT_KNOW)
+
+# ---------------------------------------------------------------------------
+# Озвучка слов
+# ---------------------------------------------------------------------------
+#: Каталог с mp3: файлы лежат как ``data/<акцент>/<слово>_<акцент>.mp3``
+#: (см. :mod:`services.audio`).
+AUDIO_DIR: Path = DATA_DIR
+
+AUDIO_ACCENT_UK = "uk"
+AUDIO_ACCENT_US = "us"
+#: Акценты в порядке кнопок озвучки в карточке слова (``🔊 🇬🇧 UK``, ``🔊 🇺🇸 US``).
+#: Акцент хранится в ``callback_data`` кнопки, поэтому каждый вариант озвучки
+#: запрашивается отдельно (см. :mod:`services.audio`).
+AUDIO_ACCENTS: tuple[str, ...] = (AUDIO_ACCENT_UK, AUDIO_ACCENT_US)
 
 # ---------------------------------------------------------------------------
 # Настройки пользователя по умолчанию

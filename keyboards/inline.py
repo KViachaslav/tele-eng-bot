@@ -17,6 +17,7 @@ import locales.ru as texts
 from db.models import User, UserSettings
 from keyboards.callbacks import (
     AnswerCallback,
+    AudioCallback,
     RegistrationCallback,
     SettingsCallback,
     ShowCallback,
@@ -255,8 +256,19 @@ def show_word_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[_button(texts.BTN_SHOW, callback)]])
 
 
+def audio_keyboard_row(word_id: int, delivery_id: int) -> list[InlineKeyboardButton]:
+    """Строка кнопок озвучки: по кнопке на каждый акцент (🇬🇧 UK и 🇺🇸 US)."""
+    return [
+        _button(
+            texts.render_audio_button(accent),
+            AudioCallback(word_id=word_id, delivery_id=delivery_id, accent=accent).pack(),
+        )
+        for accent in config.AUDIO_ACCENTS
+    ]
+
+
 def answer_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
-    """Кнопки «Знаю» / «Не знаю»."""
+    """Кнопки «Знаю» / «Не знаю» и, во второй строке, озвучка слова (два акцента)."""
     rows = [
         [
             _button(
@@ -271,7 +283,8 @@ def answer_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
                     answer=config.ANSWER_DONT_KNOW, word_id=word_id, delivery_id=delivery_id
                 ).pack(),
             ),
-        ]
+        ],
+        audio_keyboard_row(word_id, delivery_id),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

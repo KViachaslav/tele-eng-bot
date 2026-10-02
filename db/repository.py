@@ -48,6 +48,14 @@ class UserStats:
         return round(self.correct * 100 / answers, 1) if answers else 0.0
 
 
+@dataclass(slots=True)
+class DeliveryLogStats:
+    """Размер журнала отправок: число записей и максимальный идентификатор."""
+
+    count: int = 0
+    max_id: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Пользователи
 # ---------------------------------------------------------------------------
@@ -512,6 +520,18 @@ async def get_delivery(session: AsyncSession, delivery_id: int) -> DeliveryLog |
         .options(joinedload(DeliveryLog.word))
     )
     return result.scalar_one_or_none()
+
+
+async def get_delivery_log_stats(session: AsyncSession) -> DeliveryLogStats:
+    """Размер журнала отправок — для диагностики «кнопка без отправки».
+
+    Если в кнопке ``delivery_id`` больше :attr:`DeliveryLogStats.max_id`, бот
+    работает не на той базе, из которой отправлялась карточка (свежая база,
+    потерянный журнал WAL или второй экземпляр бота со своей базой).
+    """
+    result = await session.execute(select(func.count(), func.max(DeliveryLog.id)))
+    count, max_id = result.one()
+    return DeliveryLogStats(count=count or 0, max_id=max_id or 0)
 
 
 async def mark_delivery_answered(

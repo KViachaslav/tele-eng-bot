@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import EditMessageText, SendMessage
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendAudio, SendMessage
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message
 from aiogram.types import User as TgUser
 from loguru import logger
@@ -29,8 +30,8 @@ from handlers import settings as settings_handlers
 from handlers import start as start_handlers
 from handlers import word_actions
 from keyboards import inline as keyboards
-from keyboards.callbacks import AnswerCallback, SettingsCallback, ShowCallback
-from services import delivery
+from keyboards.callbacks import AnswerCallback, AudioCallback, SettingsCallback, ShowCallback
+from services import audio, delivery
 from services.message_builder import escape_text
 
 
@@ -41,6 +42,7 @@ class FakeBot:
         self.error = error
         self.sent: list[dict[str, Any]] = []
         self.edits: list[dict[str, Any]] = []
+        self.audios: list[dict[str, Any]] = []
         self.methods: list[Any] = []
 
     async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> bool:
@@ -71,6 +73,16 @@ class FakeBot:
                     "text": method.text,
                     "parse_mode": method.parse_mode,
                     "reply_markup": method.reply_markup,
+                }
+            )
+        if isinstance(method, SendAudio):
+            self.audios.append(
+                {
+                    "chat_id": method.chat_id,
+                    "audio": method.audio,
+                    "title": method.title,
+                    "performer": method.performer,
+                    "caption": method.caption,
                 }
             )
         return True
@@ -135,21 +147,74 @@ async def test_settings_filters_hit_exact_handler(
 
 
 async def test_word_actions_filters_are_disjoint() -> None:
-    """Кнопка «Показать» и кнопки ответа ведут в разные хендлеры."""
+    """«Показать», озвучка и ответы ведут в разные хендлеры."""
     bot = FakeBot()
     show = make_callback(ShowCallback(word_id=1, delivery_id=2).pack(), bot)
+    audio_click = make_callback(
+        AudioCallback(word_id=1, delivery_id=2, accent=config.AUDIO_ACCENT_UK).pack(), bot
+    )
     answer = make_callback(
         AnswerCallback(answer=config.ANSWER_KNOW, word_id=1, delivery_id=2).pack(), bot
     )
 
     assert await matched_handlers(word_actions.router, show) == {"on_show"}
+    assert await matched_handlers(word_actions.router, audio_click) == {"on_audio"}
     assert await matched_handlers(word_actions.router, answer) == {"on_answer"}
+
+
+def test_answer_keyboard_has_audio_buttons() -> None:
+    """Во второй строке клавиатуры — по кнопке озвучки на каждый акцент."""
+    markup = keyboards.answer_keyboard(word_id=7, delivery_id=9)
+    row = markup.inline_keyboard[1]
+
+    assert [button.text for button in markup.inline_keyboard[0]] == [
+        texts.BTN_KNOW,
+        texts.BTN_DONT_KNOW,
+    ]
+    assert [button.text for button in row] == [
+        texts.render_audio_button(config.AUDIO_ACCENT_UK),
+        texts.render_audio_button(config.AUDIO_ACCENT_US),
+    ]
+    assert AudioCallback.unpack(row[0].callback_data) == AudioCallback(
+        word_id=7, delivery_id=9, accent=config.AUDIO_ACCENT_UK
+    )
+    assert AudioCallback.unpack(row[1].callback_data) == AudioCallback(
+        word_id=7, delivery_id=9, accent=config.AUDIO_ACCENT_US
+    )
 
 
 def show_data_from(bot: FakeBot) -> ShowCallback:
     """Достаёт данные кнопки «Показать» из первого отправленного сообщения."""
     markup = bot.sent[0]["reply_markup"]
     return ShowCallback.unpack(markup.inline_keyboard[0][0].callback_data)
+
+
+@pytest.fixture
+def audio_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Каталог озвучки вместо ``data``: файлы создаёт сам тест.
+
+    Реальные ``data/uk`` и ``data/us`` — 192 МБ mp3, поэтому хендлер проверяется
+    на пустом каталоге: имя файла для слова тест пишет сам.
+    """
+    directory = tmp_path / "audio"
+    monkeypatch.setattr(config, "AUDIO_DIR", directory)
+    audio.clear_cache()
+    yield directory
+    audio.clear_cache()
+
+
+def make_mp3(audio_dir: Path, accent: str, word: str) -> Path:
+    """Создаёт пустой файл озвучки ``<слово>_<акцент>.mp3``."""
+    directory = audio_dir / accent
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{word}_{accent}.mp3"
+    path.write_bytes(b"ID3\x03")
+    return path
+
+
+def alerts_from(bot: FakeBot) -> list[AnswerCallbackQuery]:
+    """Ответы на нажатия (``callback.answer``) в порядке вызова."""
+    return [method for method in bot.methods if isinstance(method, AnswerCallbackQuery)]
 
 
 async def test_deliver_main_word_creates_record_and_show_button(session, user, words) -> None:
@@ -397,6 +462,32 @@ async def test_unknown_delivery_writes_reason_to_log(session, user, words) -> No
     assert "Кнопка без отправки" in log_text
     assert "delivery_id=999" in log_text
     assert "пользователь 1001" in log_text
+    assert "В журнале 0 записей, максимальный id=0" in log_text
+    assert str(config.get_settings().database_path) in log_text
+
+
+async def test_unknown_delivery_reports_journal_size(session, user, words) -> None:
+    """В логе видно, что клик пришёл из другой базы: id больше максимального.
+
+    Так выглядит работа двух экземпляров бота с разными базами: нажатие
+    обрабатывает тот, у кого журнала отправок с этим ``delivery_id`` нет.
+    """
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    bot = FakeBot()
+    answer_data = AnswerCallback(
+        answer=config.ANSWER_KNOW, word_id=words[0].id, delivery_id=999
+    )
+
+    with captured_warnings() as messages:
+        await word_actions.on_answer(
+            callback=make_callback(answer_data.pack(), bot),
+            callback_data=answer_data,
+            session=session,
+        )
+
+    log_text = "".join(messages)
+    assert "delivery_id=999" in log_text
+    assert f"В журнале 1 записей, максимальный id={sent.id}" in log_text
 
 
 async def test_foreign_delivery_writes_reason_to_log(session, user, words) -> None:
@@ -444,6 +535,148 @@ async def test_mismatched_word_writes_reason_to_log(session, user, words) -> Non
     assert "Кнопка от другого слова" in log_text
     assert f"в отправке {own.id} слово {words[0].id}" in log_text
     assert await repository.get_user_word(session, user.id, words[1].id) is None
+
+
+# ---------------------------------------------------------------------------
+# Озвучка: кнопки «🔊 🇬🇧 UK» и «🔊 🇺🇸 US»
+# ---------------------------------------------------------------------------
+async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> None:
+    """Кнопка озвучки присылает mp3 слова отдельным сообщением."""
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    file = make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert len(bot.audios) == 1
+    message = bot.audios[0]
+    assert message["chat_id"] == user.telegram_id
+    assert Path(message["audio"].path) == file
+    assert message["title"] == words[0].word
+    assert message["performer"] == texts.AUDIO_PERFORMER
+    assert message["caption"] == texts.render_audio_caption(words[0].word, config.AUDIO_ACCENT_UK)
+    # Озвучка — не ответ: карточка не правится, статистика слова не меняется.
+    assert bot.edits == []
+    assert await repository.get_user_word(session, user.id, words[0].id) is None
+    assert not alerts_from(bot)[-1].show_alert
+
+
+async def test_on_audio_sends_american_accent(session, user, words, audio_dir) -> None:
+    """Кнопка «🇺🇸 US» присылает американскую озвучку, а не британскую."""
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_US
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    file = make_mp3(audio_dir, config.AUDIO_ACCENT_US, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert Path(bot.audios[0]["audio"].path) == file
+    assert bot.audios[0]["caption"] == texts.render_audio_caption(
+        words[0].word, config.AUDIO_ACCENT_US
+    )
+
+
+async def test_on_audio_does_not_fall_back_to_other_accent(
+    session, user, words, audio_dir
+) -> None:
+    """Файла запрошенного акцента нет: алерт, а не озвучка другого акцента."""
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_US
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert bot.audios == []
+    alert = alerts_from(bot)[-1]
+    assert alert.text == texts.render_audio_not_found(config.AUDIO_ACCENT_US)
+    assert alert.show_alert is True
+
+
+async def test_on_audio_reports_missing_file(session, user, words, audio_dir) -> None:
+    """Слова нет в архиве озвучки: алерт, сообщение и статистика не меняются."""
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert bot.audios == []
+    alert = alerts_from(bot)[-1]
+    assert alert.text == texts.render_audio_not_found(config.AUDIO_ACCENT_UK)
+    assert alert.show_alert is True
+
+
+async def test_on_audio_reports_unknown_accent(session, user, words, audio_dir) -> None:
+    """Акцент в ``callback_data`` неизвестен: алерт, каталог озвучки не ищется."""
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    data = AudioCallback(word_id=words[0].id, delivery_id=sent.id, accent="de")
+    bot = FakeBot()
+
+    with captured_warnings() as messages:
+        await word_actions.on_audio(
+            callback=make_callback(data.pack(), bot), callback_data=data, session=session
+        )
+
+    assert bot.audios == []
+    alert = alerts_from(bot)[-1]
+    assert alert.text == texts.render_audio_not_found("de")
+    assert alert.show_alert is True
+    assert "Каталог озвучки" in "".join(messages)
+
+
+async def test_on_audio_reports_unknown_delivery(session, user, words, audio_dir) -> None:
+    """Кнопка из карточки без записи в журнале: подсказка «отправь /word»."""
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    data = AudioCallback(word_id=words[0].id, delivery_id=999, accent=config.AUDIO_ACCENT_UK)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert bot.audios == []
+    alert = alerts_from(bot)[-1]
+    assert alert.text == texts.render_delivery_not_found()
+    assert alert.show_alert is True
+
+
+async def test_on_audio_ignores_foreign_delivery(session, user, words, audio_dir) -> None:
+    """Чужая отправка (пересланная карточка): озвучка не отправляется."""
+    other = await repository.create_user(session, telegram_id=2003)
+    foreign = await repository.create_delivery(session, other.id, words[0].id)
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=foreign.id, accent=config.AUDIO_ACCENT_UK
+    )
+    bot = FakeBot()
+
+    with captured_warnings() as messages:
+        await word_actions.on_audio(
+            callback=make_callback(data.pack(), bot), callback_data=data, session=session
+        )
+
+    assert bot.audios == []
+    assert "Кнопка от чужой отправки" in "".join(messages)
 
 
 # ---------------------------------------------------------------------------

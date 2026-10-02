@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from config import (
+    AUDIO_ACCENT_UK,
+    AUDIO_ACCENT_US,
     FIELD_ANTONYMS,
     FIELD_COLLOCATIONS,
     FIELD_DEFINITION,
@@ -57,6 +59,8 @@ BTN_MENU_HELP = "ℹ️ Справка"
 # Инлайн-кнопки
 # ---------------------------------------------------------------------------
 BTN_SHOW = "👀 Показать"
+#: Подпись кнопки озвучки: ``🔊 {accent}`` (см. :func:`render_audio_button`).
+BTN_AUDIO = "🔊 {accent}"
 BTN_KNOW = "✅ Знаю"
 BTN_DONT_KNOW = "❌ Не знаю"
 BTN_MANUAL = "✍️ Ввести вручную"
@@ -138,7 +142,9 @@ HELP_TEXT = (
     "коллокации, синонимы и антонимы.\n\n"
     "Кнопки ответа:\n"
     "• {know} — слово становится на следующую ступень повторения;\n"
-    "• {dont_know} — слово возвращается на первую ступень и придёт снова в ближайшее окно.\n\n"
+    "• {dont_know} — слово возвращается на первую ступень и придёт снова в ближайшее окно;\n"
+    "• {audio_uk} и {audio_us} — приходит озвучка слова в британском и "
+    "американском варианте (файл mp3);\n\n"
     "Команды:\n"
     "{commands}\n\n"
     "Изученные слова повторяются раз в 90 дней и не расходуют дневной лимит.\n\n"
@@ -325,6 +331,35 @@ REFRESH_HINT = "🔁 Освежение: этот повтор не входит
 SHOW_WORD_HINT = "Слово: {word}"
 
 # ---------------------------------------------------------------------------
+# Озвучка слов (services/audio)
+# ---------------------------------------------------------------------------
+#: Подписи акцентов для подписи к файлу озвучки.
+AUDIO_ACCENT_TITLES: dict[str, str] = {
+    AUDIO_ACCENT_UK: "🇬🇧 UK",
+    AUDIO_ACCENT_US: "🇺🇸 US",
+}
+
+AUDIO_CAPTION = "{word} — {accent}"
+
+#: Исполнитель в тегах mp3: без тегов плеер Telegram показывает пустые поля.
+AUDIO_PERFORMER = "Oxford 3000"
+
+#: Алерт, если в каталоге запрошенного акцента файла для слова нет.
+AUDIO_NOT_FOUND = (
+    "🔇 {accent} озвучки для этого слова нет — словарь озвучен не полностью. "
+    "Карточку можно читать и отвечать как обычно."
+)
+
+#: Родительный падеж акцента для :data:`AUDIO_NOT_FOUND`.
+AUDIO_ACCENT_GENITIVES: dict[str, str] = {
+    AUDIO_ACCENT_UK: "Британской",
+    AUDIO_ACCENT_US: "Американской",
+}
+
+#: Если акцент в ``callback_data`` неизвестен (старая кнопка, подделка).
+AUDIO_ACCENT_GENITIVE_DEFAULT = "Нужного акцента"
+
+# ---------------------------------------------------------------------------
 # Пауза / возобновление
 # ---------------------------------------------------------------------------
 PAUSED = (
@@ -433,6 +468,8 @@ def render_help() -> str:
     return HELP_TEXT.format(
         know=BTN_KNOW,
         dont_know=BTN_DONT_KNOW,
+        audio_uk=render_audio_button(AUDIO_ACCENT_UK),
+        audio_us=render_audio_button(AUDIO_ACCENT_US),
         commands=render_commands(),
     )
 
@@ -464,3 +501,19 @@ def render_not_registered() -> str:
 def render_delivery_not_found() -> str:
     """Подсказка, если кнопка относится к неизвестной отправке."""
     return DELIVERY_NOT_FOUND.format(word_command=CMD_WORD)
+
+
+def render_audio_caption(word: str, accent: str) -> str:
+    """Подпись к файлу озвучки: слово и акцент (``apple — 🇬🇧 UK``)."""
+    return AUDIO_CAPTION.format(word=word, accent=AUDIO_ACCENT_TITLES.get(accent, accent))
+
+
+def render_audio_button(accent: str) -> str:
+    """Подпись кнопки озвучки акцента (``🔊 🇬🇧 UK``, ``🔊 🇺🇸 US``)."""
+    return BTN_AUDIO.format(accent=AUDIO_ACCENT_TITLES.get(accent, accent))
+
+
+def render_audio_not_found(accent: str) -> str:
+    """Алерт, если для слова нет файла в каталоге запрошенного акцента."""
+    genitive = AUDIO_ACCENT_GENITIVES.get(accent, AUDIO_ACCENT_GENITIVE_DEFAULT)
+    return AUDIO_NOT_FOUND.format(accent=genitive)

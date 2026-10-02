@@ -336,6 +336,27 @@ async def test_open_deliveries_can_be_limited_by_date(session, user, words, now)
     ) == {words[1].id}
 
 
+async def test_delivery_log_stats_reflect_journal_size(session, user, words, now) -> None:
+    """Число записей и максимальный id журнала — по ним видно чужую базу.
+
+    Если в кнопке ``delivery_id`` больше этого максимума, бот работает не на той
+    базе, из которой отправлялась карточка.
+    """
+    empty = await repository.get_delivery_log_stats(session)
+    assert (empty.count, empty.max_id) == (0, 0)
+
+    first = await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
+    last = await repository.create_delivery(session, user.id, words[1].id, sent_at=now)
+    await repository.mark_delivery_answered(
+        session, last, config.ANSWER_KNOW, answered_at=now
+    )
+
+    stats = await repository.get_delivery_log_stats(session)
+    assert stats.count == 2
+    assert stats.max_id == last.id
+    assert first.id < last.id
+
+
 async def test_refresh_queue_and_marking(session, user, words, now) -> None:
     """Срок освежения выученного слова и флаг ``is_refresh``."""
     progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
