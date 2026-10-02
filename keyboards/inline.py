@@ -267,6 +267,17 @@ def audio_keyboard_row(word_id: int, delivery_id: int) -> list[InlineKeyboardBut
     ]
 
 
+def audio_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура только с озвучкой: остаётся в карточке после ответа.
+
+    Telegram убирает инлайн-клавиатуру у сообщения, если ``editMessageText``
+    пришёл без ``reply_markup``. Поэтому после ответа «Знаю» / «Не знаю» карточка
+    правится с этой клавиатурой: кнопки ответа исчезают (повторный клик уже не
+    нужен), а озвучку можно послушать и после ответа — SRS она не меняет.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[audio_keyboard_row(word_id, delivery_id)])
+
+
 def answer_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
     """Кнопки «Знаю» / «Не знаю» и, во второй строке, озвучка слова (два акцента)."""
     rows = [

@@ -183,6 +183,21 @@ def test_answer_keyboard_has_audio_buttons() -> None:
     )
 
 
+def test_audio_keyboard_keeps_only_audio_row() -> None:
+    """Клавиатура после ответа: только озвучка, без кнопок «Знаю» / «Не знаю»."""
+    markup = keyboards.audio_keyboard(word_id=7, delivery_id=9)
+
+    assert len(markup.inline_keyboard) == 1
+    row = markup.inline_keyboard[0]
+    assert [button.text for button in row] == [
+        texts.render_audio_button(config.AUDIO_ACCENT_UK),
+        texts.render_audio_button(config.AUDIO_ACCENT_US),
+    ]
+    assert [AudioCallback.unpack(button.callback_data).accent for button in row] == list(
+        config.AUDIO_ACCENTS
+    )
+
+
 def show_data_from(bot: FakeBot) -> ShowCallback:
     """Достаёт данные кнопки «Показать» из первого отправленного сообщения."""
     markup = bot.sent[0]["reply_markup"]
@@ -315,7 +330,7 @@ async def test_unreachable_user_is_paused(session, user, words) -> None:
     assert await delivery.deliver_main_word(bot, session, user) is False
     assert user.paused is True
 async def test_on_answer_updates_srs_and_message(session, user, words) -> None:
-    """Ответ «Знаю» двигает этап SRS, пишет журнал и убирает инлайн-кнопки."""
+    """Ответ «Знаю» двигает этап SRS, пишет журнал и оставляет только озвучку."""
     bot = FakeBot()
     assert await delivery.deliver_main_word(bot, session, user) is True
     show_data = show_data_from(bot)
@@ -341,7 +356,18 @@ async def test_on_answer_updates_srs_and_message(session, user, words) -> None:
     assert delivery_log.answered_at is not None
 
     edited = bot.edits[-1]
-    assert edited["reply_markup"] is None
+    rows = edited["reply_markup"].inline_keyboard
+    # Строка ответа убрана: повторный клик изменил бы статистику. Озвучка осталась.
+    assert len(rows) == 1
+    assert [button.text for button in rows[0]] == [
+        texts.render_audio_button(config.AUDIO_ACCENT_UK),
+        texts.render_audio_button(config.AUDIO_ACCENT_US),
+    ]
+    assert AudioCallback.unpack(rows[0][0].callback_data) == AudioCallback(
+        word_id=show_data.word_id,
+        delivery_id=show_data.delivery_id,
+        accent=config.AUDIO_ACCENT_UK,
+    )
     assert escape_text(delivery_log.word.word) in edited["text"]
     assert bot.methods
 
@@ -564,6 +590,44 @@ async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> 
     assert bot.edits == []
     assert await repository.get_user_word(session, user.id, words[0].id) is None
     assert not alerts_from(bot)[-1].show_alert
+
+
+async def test_on_audio_works_after_answer(session, user, words, audio_dir) -> None:
+    """Кнопка озвучки из карточки после ответа по-прежнему присылает mp3.
+
+    Кнопки акцентов остаются в сообщении после «Знаю» / «Не знаю»: правя карточку
+    без ``reply_markup``, бот потерял бы всю клавиатуру — Telegram снимает её.
+    """
+    bot = FakeBot()
+    assert await delivery.deliver_main_word(bot, session, user) is True
+    show_data = show_data_from(bot)
+    answer_data = AnswerCallback(
+        answer=config.ANSWER_DONT_KNOW,
+        word_id=show_data.word_id,
+        delivery_id=show_data.delivery_id,
+    )
+
+    await word_actions.on_answer(
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+    )
+
+    word = await repository.get_word_by_id(session, show_data.word_id)
+    assert word is not None
+    file = make_mp3(audio_dir, config.AUDIO_ACCENT_UK, word.word)
+    button = bot.edits[-1]["reply_markup"].inline_keyboard[0][0]
+    audio_data = AudioCallback.unpack(button.callback_data)
+
+    await word_actions.on_audio(
+        callback=make_callback(audio_data.pack(), bot), callback_data=audio_data, session=session
+    )
+
+    assert len(bot.audios) == 1
+    assert Path(bot.audios[0]["audio"].path) == file
+    assert bot.audios[0]["caption"] == texts.render_audio_caption(
+        word.word, config.AUDIO_ACCENT_UK
+    )
 
 
 async def test_on_audio_sends_american_accent(session, user, words, audio_dir) -> None:

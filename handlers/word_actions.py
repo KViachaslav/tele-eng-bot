@@ -1,10 +1,12 @@
 """Слова: команда ``/word``, показ перевода, озвучка и ответы «Знаю» / «Не знаю».
 
 Ответ пользователя меняет состояние слова в SRS (:mod:`services.srs`) и
-фиксируется в ``delivery_log``; после ответа инлайн-кнопки у сообщения убираются,
-чтобы повторный клик не изменил статистику. Кнопки озвучки «🔊 🇬🇧 UK» и
-«🔊 🇺🇸 US» только отправляют mp3 из ``data/<акцент>`` (:mod:`services.audio`) —
-на прогресс они не влияют.
+фиксируется в ``delivery_log``; после ответа у сообщения убираются кнопки
+«Знаю» / «Не знаю», чтобы повторный клик не изменил статистику. Строка озвучки
+«🔊 🇬🇧 UK» и «🔊 🇺🇸 US» остаётся: Telegram снимает клавиатуру, если править
+текст без ``reply_markup``, поэтому после ответа карточка получает
+:func:`keyboards.inline.audio_keyboard`. Озвучка только отправляет mp3 из
+``data/<акцент>`` (:mod:`services.audio`) — на прогресс она не влияет.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from db import repository
 from db.models import DeliveryLog, User, Word, utcnow
 from handlers import common
 from keyboards.callbacks import AnswerCallback, AudioCallback, ShowCallback
-from keyboards.inline import answer_keyboard
+from keyboards.inline import answer_keyboard, audio_keyboard
 from services import audio, delivery, srs
 from services.message_builder import build_refresh_card, build_word_card, with_answer_result
 
@@ -210,7 +212,13 @@ async def on_answer(
     callback_data: AnswerCallback,
     session: AsyncSession,
 ) -> None:
-    """Обрабатывает ответ «Знаю» / «Не знаю»: SRS, журнал отправок, сообщение."""
+    """Обрабатывает ответ «Знаю» / «Не знаю»: SRS, журнал отправок, сообщение.
+
+    Клавиатура правится на :func:`keyboards.inline.audio_keyboard`: строку
+    «Знаю» / «Не знаю» убираем (ответ уже записан), а озвучку оставляем — слово
+    можно дослушать после ответа. Без ``reply_markup`` Telegram снял бы всю
+    клавиатуру вместе с кнопками акцентов.
+    """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
         return
@@ -276,6 +284,7 @@ async def on_answer(
     await common.safe_edit_text(
         callback.message,
         with_answer_result(card, result_text),
+        audio_keyboard(delivery_log.word_id, delivery_log.id),
         parse_mode=config.PARSE_MODE,
     )
     await callback.answer()
