@@ -5,8 +5,9 @@
 «Знаю» / «Не знаю», чтобы повторный клик не изменил статистику. Строка озвучки
 «🔊 🇬🇧 UK» и «🔊 🇺🇸 US» остаётся: Telegram снимает клавиатуру, если править
 текст без ``reply_markup``, поэтому после ответа карточка получает
-:func:`keyboards.inline.audio_keyboard`. Озвучка только отправляет mp3 из
-``data/<акцент>`` (:mod:`services.audio`) — на прогресс она не влияет.
+:func:`keyboards.inline.audio_keyboard`. Озвучка присылает слово из
+``data/<акцент>`` голосовым сообщением (:mod:`services.audio`) — на прогресс она
+не влияет.
 """
 from __future__ import annotations
 

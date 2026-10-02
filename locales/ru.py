@@ -333,16 +333,13 @@ SHOW_WORD_HINT = "Слово: {word}"
 # ---------------------------------------------------------------------------
 # Озвучка слов (services/audio)
 # ---------------------------------------------------------------------------
-#: Подписи акцентов для подписи к файлу озвучки.
+#: Подписи акцентов для подписи к озвучке.
 AUDIO_ACCENT_TITLES: dict[str, str] = {
     AUDIO_ACCENT_UK: "🇬🇧 UK",
     AUDIO_ACCENT_US: "🇺🇸 US",
 }
 
 AUDIO_CAPTION = "{word} — {accent}"
-
-#: Исполнитель в тегах mp3: без тегов плеер Telegram показывает пустые поля.
-AUDIO_PERFORMER = "Oxford 3000"
 
 #: Алерт, если в каталоге запрошенного акцента файла для слова нет.
 AUDIO_NOT_FOUND = (
@@ -504,7 +501,7 @@ def render_delivery_not_found() -> str:
 
 
 def render_audio_caption(word: str, accent: str) -> str:
-    """Подпись к файлу озвучки: слово и акцент (``apple — 🇬🇧 UK``)."""
+    """Подпись к озвучке: слово и акцент (``apple — 🇬🇧 UK``)."""
     return AUDIO_CAPTION.format(word=word, accent=AUDIO_ACCENT_TITLES.get(accent, accent))
 
 

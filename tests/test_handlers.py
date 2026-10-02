@@ -18,7 +18,13 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendAudio, SendMessage
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    EditMessageText,
+    SendAudio,
+    SendMessage,
+    SendVoice,
+)
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message
 from aiogram.types import User as TgUser
 from loguru import logger
@@ -36,13 +42,17 @@ from services.message_builder import escape_text
 
 
 class FakeBot:
-    """Заглушка ``Bot``: вместо HTTP-запросов собирает аргументы вызовов."""
+    """Заглушка ``Bot``: вместо HTTP-запросов собирает аргументы вызовов.
+
+    Отправки озвучки попадают в :attr:`voices`: бот шлёт голосовые сообщения
+    (``SendVoice``), а не файлы mp3 (``SendAudio``) — тесты это различают.
+    """
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.sent: list[dict[str, Any]] = []
         self.edits: list[dict[str, Any]] = []
-        self.audios: list[dict[str, Any]] = []
+        self.voices: list[dict[str, Any]] = []
         self.methods: list[Any] = []
 
     async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> bool:
@@ -75,13 +85,11 @@ class FakeBot:
                     "reply_markup": method.reply_markup,
                 }
             )
-        if isinstance(method, SendAudio):
-            self.audios.append(
+        if isinstance(method, SendVoice):
+            self.voices.append(
                 {
                     "chat_id": method.chat_id,
-                    "audio": method.audio,
-                    "title": method.title,
-                    "performer": method.performer,
+                    "voice": method.voice,
                     "caption": method.caption,
                 }
             )
@@ -567,7 +575,7 @@ async def test_mismatched_word_writes_reason_to_log(session, user, words) -> Non
 # Озвучка: кнопки «🔊 🇬🇧 UK» и «🔊 🇺🇸 US»
 # ---------------------------------------------------------------------------
 async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> None:
-    """Кнопка озвучки присылает mp3 слова отдельным сообщением."""
+    """Кнопка озвучки присылает слово отдельным голосовым сообщением."""
     sent = await repository.create_delivery(session, user.id, words[0].id)
     data = AudioCallback(
         word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
@@ -579,12 +587,10 @@ async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> 
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert len(bot.audios) == 1
-    message = bot.audios[0]
+    assert len(bot.voices) == 1
+    message = bot.voices[0]
     assert message["chat_id"] == user.telegram_id
-    assert Path(message["audio"].path) == file
-    assert message["title"] == words[0].word
-    assert message["performer"] == texts.AUDIO_PERFORMER
+    assert Path(message["voice"].path) == file
     assert message["caption"] == texts.render_audio_caption(words[0].word, config.AUDIO_ACCENT_UK)
     # Озвучка — не ответ: карточка не правится, статистика слова не меняется.
     assert bot.edits == []
@@ -592,8 +598,32 @@ async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> 
     assert not alerts_from(bot)[-1].show_alert
 
 
+async def test_on_audio_sends_voice_not_file(session, user, words, audio_dir) -> None:
+    """Озвучка уходит голосовым сообщением (``SendVoice``), а не аудиофайлом.
+
+    Telegram сам превращает mp3 в формат голосовых (OGG/OPUS), поэтому в чате
+    видно сообщение с волной: оно играет сразу, без открытия вложения и без
+    пустых полей «исполнитель»/«название».
+    """
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    audio_methods = [
+        method for method in bot.methods if isinstance(method, (SendAudio, SendVoice))
+    ]
+    assert [type(method).__name__ for method in audio_methods] == ["SendVoice"]
+
+
 async def test_on_audio_works_after_answer(session, user, words, audio_dir) -> None:
-    """Кнопка озвучки из карточки после ответа по-прежнему присылает mp3.
+    """Кнопка озвучки из карточки после ответа по-прежнему присылает голосовое.
 
     Кнопки акцентов остаются в сообщении после «Знаю» / «Не знаю»: правя карточку
     без ``reply_markup``, бот потерял бы всю клавиатуру — Telegram снимает её.
@@ -623,9 +653,9 @@ async def test_on_audio_works_after_answer(session, user, words, audio_dir) -> N
         callback=make_callback(audio_data.pack(), bot), callback_data=audio_data, session=session
     )
 
-    assert len(bot.audios) == 1
-    assert Path(bot.audios[0]["audio"].path) == file
-    assert bot.audios[0]["caption"] == texts.render_audio_caption(
+    assert len(bot.voices) == 1
+    assert Path(bot.voices[0]["voice"].path) == file
+    assert bot.voices[0]["caption"] == texts.render_audio_caption(
         word.word, config.AUDIO_ACCENT_UK
     )
 
@@ -644,8 +674,8 @@ async def test_on_audio_sends_american_accent(session, user, words, audio_dir) -
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert Path(bot.audios[0]["audio"].path) == file
-    assert bot.audios[0]["caption"] == texts.render_audio_caption(
+    assert Path(bot.voices[0]["voice"].path) == file
+    assert bot.voices[0]["caption"] == texts.render_audio_caption(
         words[0].word, config.AUDIO_ACCENT_US
     )
 
@@ -665,7 +695,7 @@ async def test_on_audio_does_not_fall_back_to_other_accent(
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert bot.audios == []
+    assert bot.voices == []
     alert = alerts_from(bot)[-1]
     assert alert.text == texts.render_audio_not_found(config.AUDIO_ACCENT_US)
     assert alert.show_alert is True
@@ -683,7 +713,7 @@ async def test_on_audio_reports_missing_file(session, user, words, audio_dir) ->
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert bot.audios == []
+    assert bot.voices == []
     alert = alerts_from(bot)[-1]
     assert alert.text == texts.render_audio_not_found(config.AUDIO_ACCENT_UK)
     assert alert.show_alert is True
@@ -701,7 +731,7 @@ async def test_on_audio_reports_unknown_accent(session, user, words, audio_dir) 
             callback=make_callback(data.pack(), bot), callback_data=data, session=session
         )
 
-    assert bot.audios == []
+    assert bot.voices == []
     alert = alerts_from(bot)[-1]
     assert alert.text == texts.render_audio_not_found("de")
     assert alert.show_alert is True
@@ -718,7 +748,7 @@ async def test_on_audio_reports_unknown_delivery(session, user, words, audio_dir
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert bot.audios == []
+    assert bot.voices == []
     alert = alerts_from(bot)[-1]
     assert alert.text == texts.render_delivery_not_found()
     assert alert.show_alert is True
@@ -739,7 +769,7 @@ async def test_on_audio_ignores_foreign_delivery(session, user, words, audio_dir
             callback=make_callback(data.pack(), bot), callback_data=data, session=session
         )
 
-    assert bot.audios == []
+    assert bot.voices == []
     assert "Кнопка от чужой отправки" in "".join(messages)
 
 
