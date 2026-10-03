@@ -66,7 +66,13 @@ class SchedulerService:
         self._logger.info("Восстановлено расписаний: {}", scheduled)
         return scheduled
 
-    async def schedule_user(self, session: AsyncSession, user: User) -> datetime | None:
+    async def schedule_user(
+        self,
+        session: AsyncSession,
+        user: User,
+        *,
+        now: datetime | None = None,
+    ) -> datetime | None:
         """(Пере)планирует следующее слово пользователя.
 
         Перед расчётом слота берётся дневной план пользователя
@@ -74,6 +80,8 @@ class SchedulerService:
         сегодня, тем реже они приходят, поэтому после каждой отправки, ответа и
         ручного запроса «дай слово» расписание считается заново.
 
+        :param now: момент расчёта (по умолчанию — текущее время); параметр нужен
+            тестам, чтобы расписание не зависело от времени суток.
         :return: момент следующей отправки в UTC или ``None``, если пользователь
             на паузе либо слот рассчитать не удалось.
         """
@@ -81,9 +89,9 @@ class SchedulerService:
             self.unschedule_user(user.id)
             return None
 
-        now = utcnow()
-        words_left = await plan.words_left_today(session, user, now)
-        moment = slots.next_slot(user, now, words_left)
+        moment_now = now or utcnow()
+        words_left = await plan.words_left_today(session, user, moment_now)
+        moment = slots.next_slot(user, moment_now, words_left)
         if moment is None:
             self._logger.warning("Не удалось рассчитать слот для пользователя {}", user.id)
             return None
