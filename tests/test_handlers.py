@@ -347,7 +347,10 @@ async def test_on_answer_updates_srs_and_message(session, user, words) -> None:
     )
 
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
 
     progress = await repository.get_user_word(session, user.id, show_data.word_id)
@@ -390,10 +393,16 @@ async def test_on_answer_rejects_second_click(session, user, words) -> None:
     )
 
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
 
     progress = await repository.get_user_word(session, user.id, show_data.word_id)
@@ -411,7 +420,10 @@ async def test_on_answer_ignores_unknown_answer(session, user, words) -> None:
     )
 
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
 
     assert await repository.get_user_word(session, user.id, show_data.word_id) is None
@@ -424,7 +436,10 @@ async def test_on_answer_reports_unknown_delivery(session, user, words) -> None:
     answer_data = AnswerCallback(answer=config.ANSWER_KNOW, word_id=1, delivery_id=999)
 
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
 
     assert bot.edits == []
@@ -490,6 +505,7 @@ async def test_unknown_delivery_writes_reason_to_log(session, user, words) -> No
             callback=make_callback(answer_data.pack(), bot),
             callback_data=answer_data,
             session=session,
+            scheduler=StubScheduler(),
         )
 
     log_text = "".join(messages)
@@ -517,6 +533,7 @@ async def test_unknown_delivery_reports_journal_size(session, user, words) -> No
             callback=make_callback(answer_data.pack(), bot),
             callback_data=answer_data,
             session=session,
+            scheduler=StubScheduler(),
         )
 
     log_text = "".join(messages)
@@ -563,6 +580,7 @@ async def test_mismatched_word_writes_reason_to_log(session, user, words) -> Non
             callback=make_callback(answer_data.pack(), bot),
             callback_data=answer_data,
             session=session,
+            scheduler=StubScheduler(),
         )
 
     log_text = "".join(messages)
@@ -641,6 +659,7 @@ async def test_on_audio_works_after_answer(session, user, words, audio_dir) -> N
         callback=make_callback(answer_data.pack(), bot),
         callback_data=answer_data,
         session=session,
+        scheduler=StubScheduler(),
     )
 
     word = await repository.get_word_by_id(session, show_data.word_id)
@@ -777,10 +796,14 @@ async def test_on_audio_ignores_foreign_delivery(session, user, words, audio_dir
 # Ручной ввод: кнопка «✍️ Ввести вручную» и шаги ввода значения
 # ---------------------------------------------------------------------------
 class StubScheduler:
-    """Заглушка ``SchedulerService``: проверяются настройки, а не расписание."""
+    """Заглушка ``SchedulerService``: помнит пересчёты, расписание не строит."""
 
-    def schedule_user(self, user: object) -> None:
-        """Ничего не планирует."""
+    def __init__(self) -> None:
+        self.rescheduled: list[int] = []
+
+    async def schedule_user(self, session: Any, user: Any) -> None:
+        """Запоминает, кому пересчитали расписание."""
+        self.rescheduled.append(user.id)
         return None
 
     def unschedule_user(self, user_id: int) -> None:
@@ -1000,7 +1023,10 @@ async def test_on_demand_repeats_only_without_alternatives(session, user, words)
         delivery_id=show_data.delivery_id,
     )
     await word_actions.on_answer(
-        callback=make_callback(answer_data.pack(), bot), callback_data=answer_data, session=session
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=StubScheduler(),
     )
 
     assert await delivery.deliver_on_demand(bot, session, user) is True
@@ -1021,6 +1047,7 @@ async def test_settings_learning_limit_opens_submenu(session, user, words) -> No
         callback_data=data,
         state=make_state(user.telegram_id),
         session=session,
+        scheduler=StubScheduler(),
     )
 
     keyboard = bot.edits[-1]["reply_markup"]
@@ -1045,6 +1072,7 @@ async def test_settings_learning_limit_preset_is_saved(session, user, words) -> 
         callback_data=data,
         state=make_state(user.telegram_id),
         session=session,
+        scheduler=StubScheduler(),
     )
 
     assert user.learning_limit == 50
@@ -1063,6 +1091,7 @@ async def test_settings_manual_learning_limit_is_saved(session, user, words) -> 
         callback_data=data,
         state=state,
         session=session,
+        scheduler=StubScheduler(),
     )
 
     assert await state.get_state() == settings_handlers.SettingsStates.learning_limit.state
@@ -1073,7 +1102,7 @@ async def test_settings_manual_learning_limit_is_saved(session, user, words) -> 
     )
 
     await settings_handlers.on_learning_limit_text(
-        message=make_message("0", bot), state=state, session=session
+        message=make_message("0", bot), state=state, session=session, scheduler=StubScheduler()
     )
 
     assert user.learning_limit == config.LEARNING_LIMIT_UNLIMITED
@@ -1089,7 +1118,7 @@ async def test_settings_learning_limit_rejects_invalid(session, user, raw: str) 
     await state.set_state(settings_handlers.SettingsStates.learning_limit)
 
     await settings_handlers.on_learning_limit_text(
-        message=make_message(raw, bot), state=state, session=session
+        message=make_message(raw, bot), state=state, session=session, scheduler=StubScheduler()
     )
 
     assert sent_texts(bot) == [
@@ -1167,7 +1196,12 @@ async def test_cmd_word_reports_learning_limit(session, user, words) -> None:
     )
     bot = FakeBot()
 
-    await word_actions.cmd_word(message=make_message(texts.CMD_WORD, bot), session=session, bot=bot)
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=StubScheduler(),
+    )
 
     assert sent_texts(bot) == [
         texts.NEW_WORDS_LIMIT_REACHED.format(learning=1, limit=1, stats=texts.CMD_STATS)
@@ -1178,10 +1212,66 @@ async def test_cmd_word_without_dictionary(session, user) -> None:
     """Пустой словарь: подсказка про импорт, а не «нет подходящего слова»."""
     bot = FakeBot()
 
-    await word_actions.cmd_word(message=make_message(texts.CMD_WORD, bot), session=session, bot=bot)
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=StubScheduler(),
+    )
 
     assert sent_texts(bot) == [texts.NO_WORDS_IN_DATABASE]
 
 
+# ---------------------------------------------------------------------------
+# Пересчёт расписания: план дня меняется — интервал меняется
+# ---------------------------------------------------------------------------
+async def test_on_answer_reschedules_next_word(session, user, words) -> None:
+    """Ответ меняет план дня, поэтому расписание пересчитывается."""
+    bot = FakeBot()
+    scheduler = StubScheduler()
+    assert await delivery.deliver_main_word(bot, session, user) is True
+    show_data = show_data_from(bot)
+    answer_data = AnswerCallback(
+        answer=config.ANSWER_DONT_KNOW,
+        word_id=show_data.word_id,
+        delivery_id=show_data.delivery_id,
+    )
+
+    await word_actions.on_answer(
+        callback=make_callback(answer_data.pack(), bot),
+        callback_data=answer_data,
+        session=session,
+        scheduler=scheduler,
+    )
+
+    assert scheduler.rescheduled == [user.id]
 
 
+async def test_cmd_word_reschedules_after_delivery(session, user, words) -> None:
+    """Слово вне расписания расходует план дня — расписание пересчитывается."""
+    bot = FakeBot()
+    scheduler = StubScheduler()
+
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=scheduler,
+    )
+
+    assert scheduler.rescheduled == [user.id]
+
+
+async def test_cmd_word_without_words_keeps_schedule(session, user) -> None:
+    """Если слова нет, план дня не менялся — расписание не трогаем."""
+    bot = FakeBot()
+    scheduler = StubScheduler()
+
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=scheduler,
+    )
+
+    assert scheduler.rescheduled == []

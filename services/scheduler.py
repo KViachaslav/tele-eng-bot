@@ -4,8 +4,9 @@
 (``DateTrigger``). После каждой отправки следующий слот рассчитывается заново,
 поэтому смена окна, числа слов, часового пояса и пауза вступают в силу сразу.
 
-Слова дня распределяются равномерно: ``interval = (end - start) /
-words_per_day`` (например, 10 слов с 09:00 до 21:00 — каждые 72 минуты).
+Интервал между словами считается от текущего момента: оставшиеся минуты окна
+делятся на оставшиеся слова дня — ``users.words_per_day`` плюс повторения, срок
+которых наступает сегодня (см. :mod:`services.plan` и :func:`services.slots.next_slot`).
 """
 from __future__ import annotations
 
@@ -15,12 +16,13 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from database import session_scope
 from db import repository
 from db.models import User, utcnow
-from services import slots
+from services import plan, slots
 from services.delivery import deliver_slot
 
 
@@ -59,13 +61,18 @@ class SchedulerService:
         scheduled = 0
         async with session_scope() as session:
             for user in await repository.list_users(session, only_active=True):
-                if self.schedule_user(user) is not None:
+                if await self.schedule_user(session, user) is not None:
                     scheduled += 1
         self._logger.info("Восстановлено расписаний: {}", scheduled)
         return scheduled
 
-    def schedule_user(self, user: User) -> datetime | None:
+    async def schedule_user(self, session: AsyncSession, user: User) -> datetime | None:
         """(Пере)планирует следующее слово пользователя.
+
+        Перед расчётом слота берётся дневной план пользователя
+        (:func:`services.plan.words_left_today`): чем меньше слов осталось на
+        сегодня, тем реже они приходят, поэтому после каждой отправки, ответа и
+        ручного запроса «дай слово» расписание считается заново.
 
         :return: момент следующей отправки в UTC или ``None``, если пользователь
             на паузе либо слот рассчитать не удалось.
@@ -74,7 +81,9 @@ class SchedulerService:
             self.unschedule_user(user.id)
             return None
 
-        moment = slots.next_slot(user, utcnow())
+        now = utcnow()
+        words_left = await plan.words_left_today(session, user, now)
+        moment = slots.next_slot(user, now, words_left)
         if moment is None:
             self._logger.warning("Не удалось рассчитать слот для пользователя {}", user.id)
             return None
@@ -92,8 +101,9 @@ class SchedulerService:
             misfire_grace_time=config.WINDOW_TOLERANCE_SECONDS,
         )
         self._logger.debug(
-            "Пользователь {}: следующее слово в {} (местное {})",
+            "Пользователь {}: слов на сегодня осталось {}, следующее слово в {} (местное {})",
             user.id,
+            words_left,
             moment.isoformat(),
             slots.local_time_string(user, moment),
         )
@@ -132,7 +142,7 @@ class SchedulerService:
                     self._logger.debug(
                         "Пользователь {}: подходящих слов нет — ждём следующий слот", user_id
                     )
-                next_moment = self.schedule_user(user)
+                next_moment = await self.schedule_user(session, user)
 
             if next_moment is not None:
                 self._logger.info(

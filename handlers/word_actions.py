@@ -25,6 +25,7 @@ from keyboards.callbacks import AnswerCallback, AudioCallback, ShowCallback
 from keyboards.inline import answer_keyboard, audio_keyboard
 from services import audio, delivery, srs
 from services.message_builder import build_refresh_card, build_word_card, with_answer_result
+from services.scheduler import SchedulerService
 
 router = Router(name="word_actions")
 
@@ -115,17 +116,19 @@ def _next_step(state: srs.SrsState) -> str:
 
 @router.message(common.command_filter(texts.CMD_WORD))
 @router.message(F.text == texts.BTN_MENU_WORD)
-async def cmd_word(message: Message, session: AsyncSession, bot: Bot) -> None:
+async def cmd_word(message: Message, session: AsyncSession, bot: Bot, scheduler: SchedulerService) -> None:
     """Присылает слово вне расписания.
 
     Если слов нет, словарь пуст или достигнут лимит слов в изучении —
-    :func:`handlers.common.no_word_text` подсказывает причину.
+    :func:`handlers.common.no_word_text` подсказывает причину. Отданное слово
+    расходует дневной план, поэтому после отправки расписание пересчитывается.
     """
     user = await common.load_user(session, message)
     if user is None:
         return
 
     if await delivery.deliver_on_demand(bot, session, user):
+        await scheduler.schedule_user(session, user)
         return
 
     await message.answer(
@@ -212,6 +215,7 @@ async def on_answer(
     callback: CallbackQuery,
     callback_data: AnswerCallback,
     session: AsyncSession,
+    scheduler: SchedulerService,
 ) -> None:
     """Обрабатывает ответ «Знаю» / «Не знаю»: SRS, журнал отправок, сообщение.
 
@@ -219,6 +223,9 @@ async def on_answer(
     «Знаю» / «Не знаю» убираем (ответ уже записан), а озвучку оставляем — слово
     можно дослушать после ответа. Без ``reply_markup`` Telegram снял бы всю
     клавиатуру вместе с кнопками акцентов.
+
+    Ответ меняет дневной план («знаю» убирает слово из сегодняшних, «не знаю»
+    возвращает его на этап 0), поэтому после ответа расписание пересчитывается.
     """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
@@ -274,6 +281,7 @@ async def on_answer(
         word.word,
         updated.stage,
     )
+    await scheduler.schedule_user(session, user)
 
     template = (
         texts.ANSWER_KNOW_RESULT

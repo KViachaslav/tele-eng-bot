@@ -110,13 +110,6 @@ def _pos_text() -> str:
     return texts.POS_MENU.format(values=", ".join(texts.POS_TITLES.values()))
 
 
-def _reschedule(scheduler: SchedulerService, user: User) -> datetime | None:
-    """Пересчитывает ближайший слот после изменения настроек рассылки."""
-    if user.paused:
-        return None
-    return scheduler.schedule_user(user)
-
-
 def _notice(user: User, value: object, moment: datetime | None) -> str:
     """Подтверждение сохранения с подсказкой о ближайшем слове."""
     return texts.SETTING_SAVED.format(value=value) + common.next_word_suffix(user, moment)
@@ -263,7 +256,7 @@ async def on_words_selected(
         words = parsed
 
     await _save_words(session, user, words)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await _edit_menu(callback, session, user, notice=_notice(user, words, moment))
     await callback.answer()
 
@@ -287,7 +280,7 @@ async def on_words_text(
         return
 
     await _save_words(session, user, words)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await state.clear()
     await _send_menu(message, session, user, notice=_notice(user, words, moment))
 
@@ -298,10 +291,12 @@ async def on_learning_limit_selected(
     callback_data: SettingsCallback,
     state: FSMContext,
     session: AsyncSession,
+    scheduler: SchedulerService,
 ) -> None:
     """Открывает подэкран «Лимит в изучении» или применяет выбранное значение.
 
-    Лимит влияет только на выдачу новых слов, поэтому расписание не пересчитывается.
+    Лимит влияет на дневной план (при достигнутом лимите новых слов нет), поэтому
+    расписание пересчитывается.
     """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
@@ -329,17 +324,23 @@ async def on_learning_limit_selected(
         return
 
     await _save_learning_limit(session, user, limit)
+    moment = await scheduler.schedule_user(session, user)
     await _edit_menu(
         callback,
         session,
         user,
-        notice=_notice(user, texts.render_learning_limit(limit), None),
+        notice=_notice(user, texts.render_learning_limit(limit), moment),
     )
     await callback.answer()
 
 
 @router.message(SettingsStates.learning_limit, common.TEXT_INPUT)
-async def on_learning_limit_text(message: Message, state: FSMContext, session: AsyncSession) -> None:
+async def on_learning_limit_text(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    scheduler: SchedulerService,
+) -> None:
     """Ручной ввод лимита слов в изучении."""
     user = await common.load_user(session, message)
     if user is None:
@@ -352,12 +353,13 @@ async def on_learning_limit_text(message: Message, state: FSMContext, session: A
         return
 
     await _save_learning_limit(session, user, limit)
+    moment = await scheduler.schedule_user(session, user)
     await state.clear()
     await _send_menu(
         message,
         session,
         user,
-        notice=_notice(user, texts.render_learning_limit(limit), None),
+        notice=_notice(user, texts.render_learning_limit(limit), moment),
     )
 
 
@@ -404,7 +406,7 @@ async def on_window_selected(
         return
 
     await _save_window(session, user, start, end)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await _edit_menu(callback, session, user, notice=_notice(user, _window_title(user), moment))
     await callback.answer()
 
@@ -459,7 +461,7 @@ async def on_window_end_text(
         return
 
     await _save_window(session, user, start, end)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await state.clear()
     await _send_menu(message, session, user, notice=_notice(user, _window_title(user), moment))
 
@@ -507,7 +509,7 @@ async def on_timezone_selected(
         return
 
     await _save_timezone(session, user, timezone)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await _edit_menu(callback, session, user, notice=_notice(user, timezone, moment))
     await callback.answer()
 
@@ -532,7 +534,7 @@ async def on_timezone_text(
         return
 
     await _save_timezone(session, user, timezone)
-    moment = _reschedule(scheduler, user)
+    moment = await scheduler.schedule_user(session, user)
     await state.clear()
     await _send_menu(message, session, user, notice=_notice(user, timezone, moment))
 
@@ -591,8 +593,13 @@ async def on_pos_toggle(
     callback: CallbackQuery,
     callback_data: SettingsCallback,
     session: AsyncSession,
+    scheduler: SchedulerService,
 ) -> None:
-    """Включает/выключает часть речи или сбрасывает фильтр."""
+    """Включает/выключает часть речи или сбрасывает фильтр.
+
+    Фильтр решает, какие повторения попадут в рассылку, то есть меняет дневной
+    план, поэтому расписание пересчитывается.
+    """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
         return
@@ -607,6 +614,7 @@ async def on_pos_toggle(
 
     await repository.set_pos_filter(session, user, selected)
     logger.info("Пользователь {} изменил фильтр частей речи: {}", user.telegram_id, selected)
+    await scheduler.schedule_user(session, user)
     await common.safe_edit_text(callback.message, _pos_text(), pos_filter_keyboard(user))
     await callback.answer()
 

@@ -103,13 +103,14 @@ async def _finish_registration(
     chat_id: int,
     state: FSMContext,
     user: User,
+    session: AsyncSession,
     scheduler: SchedulerService,
     *,
     source: MaybeInaccessibleMessage | None = None,
 ) -> None:
     """Завершает регистрацию: планирует слот и показывает итог вместе с меню."""
     await state.clear()
-    moment = scheduler.schedule_user(user)
+    moment = await scheduler.schedule_user(session, user)
     await common.drop_inline_keyboard(source)
     await bot.send_message(
         chat_id,
@@ -334,6 +335,7 @@ async def on_window_chosen(
         _chat_id(callback),
         state,
         user,
+        session,
         scheduler,
         source=callback.message,
     )
@@ -391,7 +393,7 @@ async def on_window_end_text(
         return
 
     await _save_window(session, user, start, end)
-    await _finish_registration(bot, message.chat.id, state, user, scheduler)
+    await _finish_registration(bot, message.chat.id, state, user, session, scheduler)
 
 
 @router.callback_query(RegistrationCallback.filter(F.action == config.ACTION_BACK))

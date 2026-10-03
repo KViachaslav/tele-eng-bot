@@ -378,3 +378,150 @@ async def test_refresh_queue_and_marking(session, user, words, now) -> None:
     await repository.mark_user_word_for_refresh(session, candidates[0])
     assert candidates[0].is_refresh is True
 
+
+# ---------------------------------------------------------------------------
+# План дня: подсчёт повторений «на сегодня» и начатых сегодня слов
+# ---------------------------------------------------------------------------
+async def test_count_pending_review_user_words_uses_until_boundary(
+    session, user, words, now
+) -> None:
+    """Считаются повторения со сроком не позже ``until``, свежие и просроченные."""
+    for word, due_at in zip(
+        words, (now - timedelta(days=1), now + timedelta(hours=1), now), strict=True
+    ):
+        progress = await repository.get_or_create_user_word(session, user.id, word.id)
+        await repository.save_user_word(
+            session,
+            progress,
+            stage=1,
+            status=config.STATUS_LEARNING,
+            next_review_at=due_at,
+            last_reviewed_at=now - timedelta(days=2),
+            times_correct=1,
+            times_wrong=0,
+            is_refresh=False,
+        )
+
+    # Конец сегодняшнего дня: сроки «сейчас» и «через час» тоже внутри.
+    assert (
+        await repository.count_pending_review_user_words(
+            session, user, now + timedelta(hours=2)
+        )
+        == 3
+    )
+    # Граница «сейчас»: просроченное и сегодняшнее слова попадают, будущее — нет.
+    assert await repository.count_pending_review_user_words(session, user, now) == 2
+
+
+async def test_count_pending_review_user_words_skips_learned_and_shown_today(
+    session, user, words, now
+) -> None:
+    """Выученные и освежение не считаются; показанное сегодня — только с ответом."""
+    day_start = now - timedelta(hours=12)
+    learned = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        learned,
+        stage=config.SRS_MAX_STAGE,
+        status=config.STATUS_LEARNED,
+        next_review_at=now - timedelta(days=1),
+        last_reviewed_at=now - timedelta(days=90),
+        times_correct=6,
+        times_wrong=0,
+        is_refresh=True,
+    )
+    due = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        due,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(hours=1),
+        last_reviewed_at=now - timedelta(days=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    # Слово показали сегодня и ответа не дождались — второй раз его не планируем.
+    await repository.create_delivery(
+        session, user.id, words[1].id, sent_at=now - timedelta(hours=1)
+    )
+
+    until = now + timedelta(hours=2)
+    assert await repository.count_pending_review_user_words(session, user, until) == 1
+    assert (
+        await repository.count_pending_review_user_words(
+            session, user, until, not_shown_since=day_start
+        )
+        == 0
+    )
+    # Фильтр по части речи: quickly — наречие, под фильтр «существительные» не идёт.
+    assert (
+        await repository.count_pending_review_user_words(
+            session, user, until, pos_values=[config.POS_NOUN]
+        )
+        == 0
+    )
+
+
+async def test_count_pending_review_user_words_keeps_word_reset_today(
+    session, user, words, now
+) -> None:
+    """Слово, сброшенное «не знаю» сегодня, снова ждёт показа — вопреки фильтру."""
+    day_start = now - timedelta(hours=12)
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(hours=1),
+        last_reviewed_at=now - timedelta(days=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=now - timedelta(hours=2)
+    )
+    # Ответ «не знаю»: этап 0, срок повторения наступил сразу.
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=now,
+        last_reviewed_at=now,
+        times_correct=1,
+        times_wrong=1,
+        is_refresh=False,
+    )
+
+    assert (
+        await repository.count_pending_review_user_words(
+            session, user, now + timedelta(hours=2), not_shown_since=day_start
+        )
+        == 1
+    )
+
+
+async def test_count_started_words_since_counts_first_deliveries(
+    session, user, words, now
+) -> None:
+    """Слово расходует план дня один раз — в день первой отправки."""
+    await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=now - timedelta(hours=2)
+    )
+    # Повторная отправка того же слова план дня не расходует.
+    await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=now - timedelta(hours=1)
+    )
+    await repository.create_delivery(
+        session, user.id, words[1].id, sent_at=now - timedelta(days=1)
+    )
+
+    assert (
+        await repository.count_started_words_since(session, user, now - timedelta(hours=12)) == 1
+    )
+    assert await repository.count_started_words_since(session, user, now - timedelta(days=2)) == 2
+

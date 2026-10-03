@@ -245,6 +245,24 @@ def last_sent_subquery(user: User) -> Subquery:
     )
 
 
+def first_sent_subquery(user: User) -> Subquery:
+    """Подзапрос «когда это слово впервые отправили пользователю».
+
+    Первая отправка — момент, когда слово попало «в изучение» и потратило пункт
+    дневного плана (``users.words_per_day``), поэтому по подзапросу видно, сколько
+    слов дня уже израсходовано (см. :func:`services.plan.words_left_today`).
+    """
+    return (
+        select(
+            DeliveryLog.word_id.label("word_id"),
+            func.min(DeliveryLog.sent_at).label("first_sent_at"),
+        )
+        .where(DeliveryLog.user_id == user.id)
+        .group_by(DeliveryLog.word_id)
+        .subquery()
+    )
+
+
 async def fetch_due_user_words(
     session: AsyncSession,
     user: User,
@@ -443,6 +461,74 @@ async def count_learning_user_words(session: AsyncSession, user: User) -> int:
             UserWord.status == config.STATUS_LEARNING,
         )
     )
+    return int(result.scalar_one())
+
+
+async def count_started_words_since(session: AsyncSession, user: User, since: datetime) -> int:
+    """Сколько слов пользователь начал изучать не раньше ``since``.
+
+    «Начал» — первая отправка слова (:func:`first_sent_subquery`): именно она
+    расходует пункт дневного плана ``users.words_per_day``, независимо от того,
+    пришло слово по расписанию или по запросу «дай слово».
+    """
+    first_sent = first_sent_subquery(user)
+    result = await session.execute(
+        select(func.count())
+        .select_from(first_sent)
+        .where(first_sent.c.first_sent_at >= since)
+    )
+    return int(result.scalar_one())
+
+
+async def count_pending_review_user_words(
+    session: AsyncSession,
+    user: User,
+    until: datetime,
+    *,
+    not_shown_since: datetime | None = None,
+    pos_values: Sequence[str] = (),
+) -> int:
+    """Сколько повторений ждут показа к моменту ``until``.
+
+    Считаются слова «в изучении» (этапы 0–5), срок повторения которых наступает
+    не позже ``until``: для плана дня это конец местных суток пользователя. Так в
+    план попадают и просроченные повторения, к которым ещё не приступали, и слова,
+    сброшенные на этап 0 ответом «не знаю». Выученные слова и освежение не
+    считаются: они приходят отдельным сообщением в том же слоте, места не занимая.
+
+    :param not_shown_since: если задано, уже показанные с этого момента слова не
+        считаются — кроме тех, на которые с тех пор ответили: «не знаю» возвращает
+        слово на этап 0, и оно должно прийти снова (см.
+        :func:`fetch_due_user_words`).
+    """
+    stmt = (
+        select(func.count())
+        .select_from(UserWord)
+        .join(Word, Word.id == UserWord.word_id)
+        .where(
+            UserWord.user_id == user.id,
+            UserWord.status == config.STATUS_LEARNING,
+            UserWord.is_refresh.is_(False),
+            UserWord.next_review_at.is_not(None),
+            UserWord.next_review_at <= until,
+        )
+    )
+    if not_shown_since is not None:
+        last_sent = last_sent_subquery(user)
+        stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
+            or_(
+                last_sent.c.last_sent_at.is_(None),
+                last_sent.c.last_sent_at < not_shown_since,
+                and_(
+                    UserWord.last_reviewed_at.is_not(None),
+                    UserWord.last_reviewed_at >= not_shown_since,
+                ),
+            )
+        )
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
     return int(result.scalar_one())
 
 

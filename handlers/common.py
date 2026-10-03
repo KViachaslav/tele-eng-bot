@@ -244,7 +244,7 @@ async def cmd_resume(message: Message, session: AsyncSession, scheduler: Schedul
         return
 
     await repository.update_user(session, user, paused=False)
-    moment = scheduler.schedule_user(user)
+    moment = await scheduler.schedule_user(session, user)
     logger.info("Пользователь {} возобновил рассылку", user.telegram_id)
     await message.answer(
         texts.RESUMED.format(window_start=user.window_start, window_end=user.window_end)

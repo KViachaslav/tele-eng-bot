@@ -125,46 +125,113 @@ def test_check_window_rejects_too_short_range() -> None:
 # ---------------------------------------------------------------------------
 # Слоты
 # ---------------------------------------------------------------------------
-def test_slot_interval_divides_window() -> None:
-    """10 слов в окне 09:00–21:00 — каждые 72 минуты."""
-    user = make_user(words_per_day=10)
-    assert slots.slot_interval(user) == timedelta(minutes=72)
+def test_slot_interval_divides_left_time_by_left_words() -> None:
+    """Интервал — это оставшееся время окна, делённое на оставшиеся слова."""
+    assert slots.slot_interval(12 * 60, 10) == timedelta(minutes=72)
+    assert slots.slot_interval(9 * 60, 10) == timedelta(minutes=54)
+
+
+def test_slot_interval_counts_repetitions_of_the_day() -> None:
+    """Повторения входят в план дня, поэтому слова приходят чаще.
+
+    15 запланированных слов и 15 слов, сброшенных на этап 0 вчерашним «не знаю»,
+    при окне 10:00–21:00 (660 минут) — каждые 22 минуты; без повторений —
+    каждые 44.
+    """
+    assert slots.slot_interval(11 * 60, 30) == timedelta(minutes=22)
+    assert slots.slot_interval(11 * 60, 15) == timedelta(minutes=44)
 
 
 def test_slot_interval_respects_minimum() -> None:
     """Слишком частые слоты не сжимаются ниже минимального интервала."""
-    user = make_user(words_per_day=50, window_start="09:00", window_end="09:30")
-    assert slots.slot_interval(user) == timedelta(minutes=config.MIN_SLOT_INTERVAL_MINUTES)
+    minimum = timedelta(minutes=config.MIN_SLOT_INTERVAL_MINUTES)
+
+    assert slots.slot_interval(30, 50) == minimum
+    assert slots.slot_interval(0, 1) == minimum
 
 
-def test_slots_for_day_distribution() -> None:
-    """Слов дня ровно ``words_per_day``: первое в начале окна, далее равномерно."""
-    user = make_user(words_per_day=4)
-    day_slots = slots.slots_for_day(user, date(2026, 1, 15))
+def test_window_minutes_left() -> None:
+    """Оставшиеся минуты окна: до открытия — всё окно, после закрытия — ноль."""
+    user = make_user(timezone_name="UTC", window_start="09:00", window_end="21:00")
 
-    assert len(day_slots) == 4
-    assert day_slots[0].strftime(config.TIME_FORMAT) == "09:00"
-    assert day_slots[-1].strftime(config.TIME_FORMAT) == "18:00"
-    assert day_slots[1] - day_slots[0] == slots.slot_interval(user)
-    assert all(moment.tzinfo == user.tzinfo for moment in day_slots)
+    assert slots.window_minutes_left(user, datetime(2026, 1, 15, 8, 0)) == 12 * 60
+    assert slots.window_minutes_left(user, datetime(2026, 1, 15, 12, 0)) == 9 * 60
+    assert slots.window_minutes_left(user, datetime(2026, 1, 15, 21, 0)) == 0
+
+
+def test_window_end_datetime_handles_midnight_close() -> None:
+    """«00:00» в конце окна — это конец суток, а не их начало."""
+    user = make_user(timezone_name="UTC", window_start="12:00", window_end="00:00")
+
+    assert slots.window_end_datetime(user, date(2026, 1, 15)) == datetime(
+        2026, 1, 16, 0, 0, tzinfo=user.tzinfo
+    )
+
+
+def test_next_slot_divides_left_time_and_words() -> None:
+    """Новое слово приходит через «оставшееся время / оставшиеся слова»."""
+    user = make_user(timezone_name="UTC", words_per_day=10)
+
+    # 12:00, окончится в 21:00: 9 часов на 10 оставшихся слов — 54 минуты.
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 12, 0), 10)
+
+    assert moment == datetime(2026, 1, 15, 12, 54, tzinfo=timezone.utc)
+
+
+def test_next_slot_with_repetitions_of_the_day_comes_faster() -> None:
+    """15 запланированных слов и 15 повторений — каждые 22 минуты."""
+    user = make_user(
+        timezone_name="UTC", words_per_day=15, window_start="10:00", window_end="21:00"
+    )
+
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 10, 0), 30)
+
+    assert moment == datetime(2026, 1, 15, 10, 22, tzinfo=timezone.utc)
 
 
 def test_next_slot_returns_utc_moment() -> None:
-    """Ближайший слот возвращается в UTC и строго позже «сейчас»."""
+    """До открытия окна первое слово дня уходит в ``window_start``."""
     user = make_user(timezone_name="Europe/Moscow", words_per_day=10)
 
-    moment = slots.next_slot(user, datetime(2026, 1, 15, 5, 0, tzinfo=timezone.utc))
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 5, 0, tzinfo=timezone.utc), 10)
 
     assert moment == datetime(2026, 1, 15, 6, 0, tzinfo=timezone.utc)
 
 
 def test_next_slot_skips_to_next_day() -> None:
-    """Если все слоты дня прошли, берётся начало окна следующего дня."""
+    """Если окно уже закрыто, берётся начало окна следующего дня."""
     user = make_user(timezone_name="Europe/Moscow", words_per_day=10)
 
-    moment = slots.next_slot(user, datetime(2026, 1, 15, 19, 0, tzinfo=timezone.utc))
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 19, 0, tzinfo=timezone.utc), 10)
 
     assert moment == datetime(2026, 1, 16, 6, 0, tzinfo=timezone.utc)
+
+
+def test_next_slot_with_empty_plan_moves_to_next_day() -> None:
+    """Ноль слов в плане — сегодня слов больше не будет."""
+    user = make_user(timezone_name="UTC", words_per_day=10)
+
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 12, 0), 0)
+
+    assert moment == datetime(2026, 1, 16, 9, 0, tzinfo=timezone.utc)
+
+
+def test_next_slot_puts_last_word_at_window_end() -> None:
+    """Когда слово осталось одно, оно приходится на конец окна."""
+    user = make_user(timezone_name="UTC", words_per_day=10)
+
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 12, 0), 1)
+
+    assert moment == datetime(2026, 1, 15, 21, 0, tzinfo=timezone.utc)
+
+
+def test_next_slot_does_not_go_past_window_end() -> None:
+    """В последнюю минуту окна слот не выходит за его границу."""
+    user = make_user(timezone_name="UTC", words_per_day=10)
+
+    moment = slots.next_slot(user, datetime(2026, 1, 15, 20, 59, 30), 1)
+
+    assert moment == datetime(2026, 1, 15, 21, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -215,4 +282,18 @@ def test_local_day_start_utc_counts_days_by_user_timezone() -> None:
     utc_user = make_user(timezone_name="UTC")
     assert slots.local_day_start_utc(utc_user, datetime(2026, 1, 15, 9, 0)) == datetime(
         2026, 1, 15, 0, 0
+    )
+
+
+def test_local_day_end_utc_counts_days_by_user_timezone() -> None:
+    """Конец «сегодня» — полночь по поясу пользователя (в UTC — вечер того же дня)."""
+    moscow = make_user(timezone_name="Europe/Moscow")
+
+    assert slots.local_day_end_utc(moscow, datetime(2026, 1, 15, 9, 0)) == datetime(
+        2026, 1, 15, 21, 0
+    )
+
+    utc_user = make_user(timezone_name="UTC")
+    assert slots.local_day_end_utc(utc_user, datetime(2026, 1, 15, 9, 0)) == datetime(
+        2026, 1, 16, 0, 0
     )

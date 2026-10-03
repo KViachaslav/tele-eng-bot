@@ -3,6 +3,11 @@
 Модуль не обращается ни к БД, ни к Telegram — только чистые функции от настроек
 пользователя и момента времени. Поэтому его легко покрывать юнит-тестами
 (см. ``tests/test_slots.py``).
+
+Интервал до следующего слова считается не на весь день вперёд, а от текущего
+момента: оставшиеся минуты окна делятся на оставшиеся слова дня
+(:func:`slot_interval`). Сколько слов осталось, знает :mod:`services.plan` — это
+``users.words_per_day`` плюс повторения, срок которых наступает сегодня.
 """
 from __future__ import annotations
 
@@ -129,39 +134,82 @@ def check_window(start: time, end: time, words_per_day: int) -> WindowCheck:
     return WindowCheck(current_minutes=length, required_minutes=required)
 
 
-def slot_interval(user: User) -> timedelta:
-    """Интервал между словами внутри окна: длина окна, делённая на число слов."""
-    start = user.window_start_time
-    end = user.window_end_time
-    length_seconds = window_length_minutes(start, end) * 60
-    interval_seconds = length_seconds / max(1, user.words_per_day)
-    minimum_seconds = config.MIN_SLOT_INTERVAL_MINUTES * 60
-    return timedelta(seconds=max(interval_seconds, minimum_seconds))
-
-
 def window_start_datetime(user: User, day: date) -> datetime:
     """Момент начала окна в местном времени пользователя."""
     return datetime.combine(day, user.window_start_time, tzinfo=user.tzinfo)
 
 
-def slots_for_day(user: User, day: date) -> list[datetime]:
-    """Слоты рассылки на конкретный день (местное время пользователя).
+def window_end_datetime(user: User, day: date) -> datetime:
+    """Момент окончания окна в местном времени пользователя.
 
-    Первое слово уходит в начале окна, последнее — за один интервал до его конца.
+    ``00:00`` в поле «конец» — это конец суток (см. :func:`window_length_minutes`),
+    поэтому окно «12:00–00:00» закрывается в полночь следующего дня.
     """
-    base = window_start_datetime(user, day)
-    interval = slot_interval(user)
-    return [base + interval * index for index in range(max(1, user.words_per_day))]
+    base = datetime.combine(day, user.window_end_time, tzinfo=user.tzinfo)
+    if user.window_end_time == time(0, 0):
+        return base + timedelta(days=1)
+    return base
 
 
-def next_slot(user: User, now_utc: datetime) -> datetime | None:
-    """Ближайший слот пользователя строго после ``now_utc`` (в UTC)."""
+def window_minutes_left(user: User, now_utc: datetime) -> int:
+    """Сколько минут окна осталось до его закрытия сегодня.
+
+    До открытия окна возвращается полная длина окна (первое слово дня уходит в
+    ``window_start``), после закрытия — ``0``.
+    """
     local_now = as_utc(now_utc).astimezone(user.tzinfo)
+    start = window_start_datetime(user, local_now.date())
+    if local_now < start:
+        return window_length_minutes(user.window_start_time, user.window_end_time)
+    end = window_end_datetime(user, local_now.date())
+    if local_now >= end:
+        return 0
+    return int((end - local_now).total_seconds() // 60)
+
+
+def slot_interval(minutes_left: int, words_left: int) -> timedelta:
+    """Интервал до следующего слова: оставшееся время окна / оставшиеся слова.
+
+    Слова дня — это не только ``words_per_day``: к ним добавляются повторения,
+    срок которых наступает сегодня. Пример: 15 запланированных слов и 15 слов,
+    сброшенных на этап 0 вчерашним «не знаю», при окне в 11 часов — каждые
+    22 минуты (660 / 30).
+
+    Как только слово уходит из плана (ответ «знаю») или пользователь забирает
+    слово вне расписания, слов остаётся меньше и интервал растёт: слова
+    «расходятся» по оставшемуся времени окна.
+
+    Ниже :data:`config.MIN_SLOT_INTERVAL_MINUTES` интервал не опускается.
+    """
+    seconds = max(minutes_left, 0) * 60 / max(1, words_left)
+    return timedelta(seconds=max(seconds, config.MIN_SLOT_INTERVAL_MINUTES * 60))
+
+
+def next_slot(user: User, now_utc: datetime, words_left: int) -> datetime | None:
+    """Ближайший слот пользователя строго после ``now_utc`` (в UTC).
+
+    :param words_left: сколько слов ещё нужно отправить сегодня (см.
+        :func:`services.plan.words_left_today`). ``0`` означает, что с планом дня
+        покончено: следующее слово придёт с открытием окна.
+    :return: момент следующей отправки или ``None``, если рассчитать не удалось.
+    """
+    local_now = as_utc(now_utc).astimezone(user.tzinfo)
+    if words_left <= 0:
+        next_day = window_start_datetime(user, local_now.date() + timedelta(days=1))
+        return next_day.astimezone(timezone.utc)
+
     for day_offset in range(config.SCHEDULER_LOOKAHEAD_DAYS):
         day = (local_now + timedelta(days=day_offset)).date()
-        for slot in slots_for_day(user, day):
-            if slot > local_now:
-                return slot.astimezone(timezone.utc)
+        start = window_start_datetime(user, day)
+        if local_now < start:
+            # окно ещё не открылось — первое слово дня уходит в его начале
+            return start.astimezone(timezone.utc)
+        end = window_end_datetime(user, day)
+        if local_now >= end:
+            continue
+        moment = local_now + slot_interval(window_minutes_left(user, now_utc), words_left)
+        # слова не разошлись по времени: последнее из них — у самого конца окна
+        return min(moment, end).astimezone(timezone.utc)
     return None
 
 
@@ -191,6 +239,18 @@ def local_day_start_utc(user: User, now_utc: datetime) -> datetime:
     local_now = as_utc(now_utc).astimezone(user.tzinfo)
     local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     return local_start.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def local_day_end_utc(user: User, now_utc: datetime) -> datetime:
+    """Конец текущих суток пользователя, в наивном UTC (как даты в БД).
+
+    Используется как граница «пора показать»: одним запросом отбираются слова,
+    срок повторения которых наступает в течение сегодняшних суток пользователя
+    (см. :func:`services.plan.words_left_today`).
+    """
+    local_now = as_utc(now_utc).astimezone(user.tzinfo)
+    local_end = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return local_end.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def as_utc(moment: datetime) -> datetime:
