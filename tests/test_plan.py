@@ -5,18 +5,30 @@
 оставшееся время окна (``services.slots.next_slot``), поэтому здесь проверяются
 все способы, которыми число меняется: начатое сегодня слово (в том числе
 забранное кнопкой «🎲 Слово»), ответы «знаю» и «не знаю», лимит слов в изучении и
-фильтр частей речи.
+фильтр частей речи. Повторения считаются на всех этапах (0–5), а не только на
+этапе 0 после «не знаю»: выученные слова плана не занимают.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from db import repository
-from db.models import User, UserWord
+from db.models import User, UserWord, Word
 from services import plan, slots
+
+#: Дополнительные слова: вместе с фикстурой ``words`` их ровно семь, чтобы занять
+#: каждый этап SRS (0–6) в одном тесте
+#: (см. :func:`test_plan_counts_repetitions_of_every_stage`).
+EXTRA_STAGE_WORDS: tuple[dict[str, object], ...] = (
+    {"word": "lantern", "part_of_speech": "noun"},
+    {"word": "harvest", "part_of_speech": "noun"},
+    {"word": "sleepy", "part_of_speech": "adjective"},
+    {"word": "steady", "part_of_speech": "adjective"},
+)
 
 
 async def put_due(
@@ -186,6 +198,47 @@ async def test_plan_ignores_distant_and_learned_words(session, user, words, now)
     )
 
     assert await plan.words_left_today(session, user, now) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ограничения: лимит слов в изучении и фильтр частей речи
+async def test_plan_counts_repetitions_of_every_stage(session, user, words, now) -> None:
+    """Повторения «на сегодня» входят в план на любом этапе 0–5, а не только после «не знаю».
+
+    У каждого этапа свой срок (1/3/7/14/30 дней), поэтому в план дня попадают и
+    слова, сброшенные на этап 0 ответом «не знаю», и обычные повторения этапов
+    1–5. Выученное слово (этап 6) план не занимает: освежение приходит отдельным
+    сообщением в том же слоте.
+    """
+    await repository.upsert_words(session, EXTRA_STAGE_WORDS)
+    result = await session.execute(select(Word).order_by(Word.id))
+    dictionary = list(result.scalars().all())
+    assert len(dictionary) == config.SRS_MAX_STAGE + 1, "нужны слова для всех этапов 0–6"
+    # Новых слов в плане нет: все слова словаря уже начаты.
+    for word in dictionary:
+        await repository.get_or_create_user_word(session, user.id, word.id)
+
+    for stage, word in enumerate(dictionary):
+        progress = await repository.get_user_word(session, user.id, word.id)
+        assert progress is not None
+        await repository.save_user_word(
+            session,
+            progress,
+            stage=stage,
+            status=(
+                config.STATUS_LEARNED
+                if stage == config.SRS_MAX_STAGE
+                else config.STATUS_LEARNING
+            ),
+            next_review_at=now - timedelta(days=1),
+            last_reviewed_at=now - timedelta(days=1),
+            times_correct=stage,
+            times_wrong=0,
+            is_refresh=stage == config.SRS_MAX_STAGE,
+        )
+
+    # Шесть слов «в изучении» (этапы 0–5) и ни одного выученного.
+    assert await plan.words_left_today(session, user, now) == config.SRS_MAX_STAGE
 
 
 # ---------------------------------------------------------------------------
