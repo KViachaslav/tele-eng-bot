@@ -499,7 +499,11 @@ async def count_pending_review_user_words(
     :param not_shown_since: если задано, уже показанные с этого момента слова не
         считаются — кроме тех, на которые с тех пор ответили: «не знаю» возвращает
         слово на этап 0, и оно должно прийти снова (см.
-        :func:`fetch_due_user_words`).
+        :func:`fetch_due_user_words`). Карточка, отправленная после последнего
+        ответа, план не занимает: слово уже в чате у пользователя, заново его
+        планировать не нужно. Поэтому каждая отправка (в том числе кнопкой
+        «🎲 Слово») уменьшает план дня, а интервал до следующего слова растёт
+        (см. :mod:`services.plan`).
     """
     stmt = (
         select(func.count())
@@ -522,6 +526,7 @@ async def count_pending_review_user_words(
                 and_(
                     UserWord.last_reviewed_at.is_not(None),
                     UserWord.last_reviewed_at >= not_shown_since,
+                    UserWord.last_reviewed_at >= last_sent.c.last_sent_at,
                 ),
             )
         )

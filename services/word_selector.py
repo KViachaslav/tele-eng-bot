@@ -10,8 +10,9 @@
 «не знаю» (у него срок повторения наступает сразу).
 
 Новые слова выбираются **случайно** (а не по порядку загрузки словаря) и только
-пока слов «в изучении» меньше ``users.learning_limit``: лимит общий для рассылки
-по слотам и для запроса «дай слово».
+пока слов «в изучении» меньше ``users.learning_limit`` и не израсходован дневной
+план ``users.words_per_day``: оба ограничения общие для рассылки по слотам и для
+запроса «дай слово».
 """
 from __future__ import annotations
 
@@ -52,6 +53,24 @@ async def new_words_allowed(session: AsyncSession, user: User) -> bool:
     return learning < user.learning_limit
 
 
+async def new_words_left_today(session: AsyncSession, user: User, now: datetime) -> bool:
+    """Остались ли на сегодня новые слова по дневному плану.
+
+    Пункт дневного плана расходует первая отправка слова, поэтому после
+    ``users.words_per_day`` начатых сегодня слов новых больше не показывают — ни
+    по расписанию, ни по запросу «дай слово». Иначе кнопка «🎲 Слово» выдавала бы
+    слова сверх дневного плана: план дня не уменьшался бы от такой отправки, и
+    интервал до следующего слова не увеличивался, хотя слов на сегодня уже меньше
+    не становится (см. :mod:`services.plan`).
+
+    Повторения уже начатых слов и освежение дневным планом не ограничены:
+    пользователь продолжает работать с тем, что взял.
+    """
+    day_start = slots.local_day_start_utc(user, now)
+    started = await repository.count_started_words_since(session, user, day_start)
+    return started < user.words_per_day
+
+
 async def select_main_word(
     session: AsyncSession,
     user: User,
@@ -66,7 +85,8 @@ async def select_main_word(
     1. повторения, которых сегодня ещё не показывали (``not_shown_since``) —
        слова с наступившим сроком повторения, этапы 1–5;
     2. новое слово (в случайном порядке) — пока не достигнут лимит
-       ``users.learning_limit``;
+       ``users.learning_limit`` и не израсходован дневной план
+       ``users.words_per_day`` (:func:`new_words_left_today`);
     3. оставшиеся повторения, то есть слова, которые сегодня уже показывали.
 
     Третий пункт нужен для «не знаю»: ответ сбрасывает слово на этап 0, и его срок
@@ -97,18 +117,24 @@ async def select_main_word(
         user_word = due_words[0]
         return SelectedWord(word=user_word.word, user_word=user_word)
 
-    if await new_words_allowed(session, user):
-        fresh_words = await repository.fetch_new_words(
-            session, user, 1, pos_values, exclude_word_ids=exclude_word_ids
-        )
-        if fresh_words:
-            return SelectedWord(word=fresh_words[0])
-    else:
+    if not await new_words_allowed(session, user):
         logger.debug(
             "Пользователь {}: лимит слов в изучении ({}) достигнут — новых слов не показываю",
             user.telegram_id,
             user.learning_limit,
         )
+    elif not await new_words_left_today(session, user, now):
+        logger.debug(
+            "Пользователь {}: дневной план новых слов ({}) выполнен — новых слов не показываю",
+            user.telegram_id,
+            user.words_per_day,
+        )
+    else:
+        fresh_words = await repository.fetch_new_words(
+            session, user, 1, pos_values, exclude_word_ids=exclude_word_ids
+        )
+        if fresh_words:
+            return SelectedWord(word=fresh_words[0])
 
     # Всё, что осталось, — повторение слова, которое сегодня уже показывали.
     repeated_words = await repository.fetch_due_user_words(

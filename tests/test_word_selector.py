@@ -102,6 +102,29 @@ async def test_todays_repeat_returns_when_new_words_blocked(session, user, words
     assert selected.word.word == "apple"
 
 
+async def test_daily_plan_blocks_new_words(session, user, words, now) -> None:
+    """Новых слов сверх дневного плана не выдаём — ни по кнопке, ни по расписанию.
+
+    Регрессия: кнопка «🎲 Слово» отдавала новые слова сверх ``words_per_day``
+    (за день их набиралось вдвое больше плана). Такая отправка план дня не
+    уменьшала, поэтому интервал до следующего слова не увеличивался, а к концу
+    окна только сокращался.
+    """
+    await repository.update_user(session, user, words_per_day=2)
+    await show_word(session, user, words[0].id, now)
+
+    # Один пункт дневного плана ещё свободен — новое слово приходит.
+    selected = await word_selector.select_main_word(session, user, now)
+
+    assert selected is not None
+    assert selected.user_word is None
+
+    await show_word(session, user, words[1].id, now)
+
+    # Дневной план выполнен: новых слов больше нет.
+    assert await word_selector.select_main_word(session, user, now) is None
+
+
 async def test_excluded_words_are_skipped(session, user, words, now) -> None:
     """Исключённые слова не попадают ни в одну из очередей."""
     await put_in_learning(session, user.id, words[0].id, now, hours_ago=2)

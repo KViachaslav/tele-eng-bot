@@ -108,10 +108,11 @@ class SchedulerService:
             # если бот был выключен дольше допуска — слот не «догоняем» задним числом
             misfire_grace_time=config.WINDOW_TOLERANCE_SECONDS,
         )
-        self._logger.debug(
-            "Пользователь {}: слов на сегодня осталось {}, следующее слово в {} (местное {})",
+        self._logger.info(
+            "Пользователь {}: план дня {}, интервал {} мин, следующее слово в {} (местное {})",
             user.id,
             words_left,
+            round((moment - slots.as_utc(moment_now)).total_seconds() / 60, 1),
             moment.isoformat(),
             slots.local_time_string(user, moment),
         )

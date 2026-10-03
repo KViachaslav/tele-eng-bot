@@ -157,6 +157,42 @@ async def test_plan_returns_word_reset_by_dont_know(session, user, words, now) -
     assert await plan.words_left_today(session, user, answered_at) == 2
 
 
+async def test_plan_drops_word_shown_again_after_answer(session, user, words, now) -> None:
+    """Повторно отправленное слово план дня больше не занимает.
+
+    Регрессия: слово, на которое ответили «не знаю» (в план оно вернулось), а
+    затем пришло второй раз, продолжало занимать план дня до ответа на новую
+    карточку. План дня из-за этого не убывал от отправок, и интервал до
+    следующего слова только сокращался к концу окна — в том числе после нажатия
+    кнопки «🎲 Слово».
+    """
+    await repository.update_user(session, user, words_per_day=1)
+    progress = await put_due(session, user.id, words[0].id, now, days_ago=1)
+    await show_word(session, user, words[0].id, now, days_ago=1)
+    await show_word(session, user, words[0].id, now)
+
+    # «Не знаю» вернуло слово в план дня: его покажут ещё раз (1 новое + 1 повторение).
+    answered_at = now + timedelta(minutes=30)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=answered_at,
+        last_reviewed_at=answered_at,
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    assert await plan.words_left_today(session, user, answered_at) == 2
+
+    # Слово пришло снова: карточка ждёт ответа, поэтому план дня на слово легче.
+    again_at = answered_at + timedelta(minutes=1)
+    await show_word(session, user, words[0].id, again_at)
+
+    assert await plan.words_left_today(session, user, again_at) == 1
+
+
 async def test_plan_drops_word_answered_know(session, user, words, now) -> None:
     """«Знаю» убирает слово из плана: следующий показ — только через дни."""
     await repository.update_user(session, user, words_per_day=1)

@@ -121,6 +121,43 @@ async def test_spent_word_moves_next_word_later(session, user, words) -> None:
     assert interval(after) == pytest.approx(interval(before) * 3 / 2, rel=0.002)
 
 
+async def test_delivered_repeat_moves_next_word_later(session, user, words) -> None:
+    """Пришедшее повторение разряжает график: следующее слово придёт позже.
+
+    Регрессия: слово, на которое сегодня ответили «не знаю», вернулось в план дня
+    и оставалось в нём даже после повторной отправки — до следующего ответа. План
+    дня не убывал от отправок, поэтому интервал до следующего слова только
+    сокращался к концу окна, в том числе после кнопки «🎲 Слово».
+    """
+    await repository.update_user(
+        session, user, words_per_day=1, window_start=FULL_DAY[0], window_end=FULL_DAY[1]
+    )
+    # Слово начато вчера, сегодня на него ответили «не знаю» — срок наступил снова.
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=NOW - timedelta(hours=1),
+        last_reviewed_at=NOW - timedelta(hours=1),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=NOW - timedelta(days=1)
+    )
+    scheduler = SchedulerService(StubBot())
+    before = await scheduler.schedule_user(session, user, now=NOW)
+
+    # Повторение пришло снова: карточка ждёт ответа, план дня — на слово меньше.
+    await repository.create_delivery(session, user.id, words[0].id, sent_at=NOW)
+    after = await scheduler.schedule_user(session, user, now=NOW)
+
+    assert interval(after) == pytest.approx(interval(before) * 2, rel=0.002)
+
+
 async def test_empty_plan_waits_for_next_window(session, user, words) -> None:
     """План дня выполнен — следующее слово придёт с открытием окна."""
     await repository.update_user(
