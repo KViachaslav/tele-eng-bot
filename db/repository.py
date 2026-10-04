@@ -378,6 +378,37 @@ def first_sent_subquery(user: User) -> Subquery:
     )
 
 
+def waiting_for_repeat_condition(
+    last_sent: Subquery, not_shown_since: datetime
+) -> ColumnElement[bool]:
+    """Условие «слово снова ждёт отправки, хотя сегодня уже приходило».
+
+    Карточка ушла сегодня и осталась без ответа — выбирать такое слово второй раз
+    нельзя: отправка прогресс не двигает, порядок очереди не меняется, и бот
+    зацикливается на самом просроченном слове. В базе 04.10.2026 так и вышло:
+    «seat» (этап 0 после «не знаю») уходило 11 раз подряд, пока не закрылось окно
+    рассылки, а план дня всё это время считал слово не отданным.
+
+    Слово снова ждёт отправки, если карточки сегодня не было вовсе или на неё уже
+    ответили: «не знаю» возвращает слово на этап 0, и оно должно прийти снова.
+
+    Условие общее для очереди повторений (:func:`fetch_due_user_words`) и дневного
+    плана (:func:`count_pending_review_user_words`). Если они разойдутся, план
+    будет считать слова, которых очередь показать не может: план перестанет
+    убывать от отправок, а интервал до следующего слова будет только сокращаться
+    (см. :mod:`services.plan`).
+    """
+    return or_(
+        last_sent.c.last_sent_at.is_(None),
+        last_sent.c.last_sent_at < not_shown_since,
+        and_(
+            UserWord.last_reviewed_at.is_not(None),
+            UserWord.last_reviewed_at >= not_shown_since,
+            UserWord.last_reviewed_at >= last_sent.c.last_sent_at,
+        ),
+    )
+
+
 async def fetch_due_user_words(
     session: AsyncSession,
     user: User,
@@ -395,10 +426,12 @@ async def fetch_due_user_words(
 
     :param exclude_word_ids: слова, которые сейчас показывать не нужно (например,
         уже отправленные карточки без ответа при ручном запросе ``/word``).
-    :param not_shown_since: если задано, в выборку попадают только слова, которых
-        пользователю не показывали с этого момента (см.
+    :param not_shown_since: если задано, в выборку попадают только слова, которые
+        с этого момента снова ждут отправки: карточки сегодня не было вовсе или на
+        неё уже ответили (:func:`waiting_for_repeat_condition`, см. также
         :func:`services.slots.local_day_start_utc`). Так очередь сначала отдаёт
-        повторения, которых сегодня ещё не было, и только потом новое слово.
+        повторения, которых сегодня ещё не было, и только потом новое слово, а
+        карточка, которая висит в чате без ответа, второй раз не приходит.
     """
     stmt = (
         select(UserWord)
@@ -421,10 +454,7 @@ async def fetch_due_user_words(
     if not_shown_since is not None:
         last_sent = last_sent_subquery(user)
         stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
-            or_(
-                last_sent.c.last_sent_at.is_(None),
-                last_sent.c.last_sent_at < not_shown_since,
-            )
+            waiting_for_repeat_condition(last_sent, not_shown_since)
         )
     if exclude_word_ids:
         stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
@@ -542,6 +572,35 @@ async def fetch_shown_word_ids_since(
     return result.scalars().all()
 
 
+async def fetch_unanswered_word_ids_since(
+    session: AsyncSession, user: User, since: datetime | None = None
+) -> Sequence[int]:
+    """Слова, карточки которых ушли пользователю и остались без ответа.
+
+    Отличие от :func:`fetch_shown_word_ids_since` — в ответе на карточку. Слово,
+    на которое ответили, прогресс уже получило, и повторить его можно; карточка
+    же, которая висит в чате без ответа, второй раз не приходит, иначе очередь
+    зацикливается на самом просроченном слове (см.
+    :func:`services.word_selector.select_main_word`).
+
+    :param since: если задано, учитываются только отправки не раньше этого
+        момента. Карточка прошлых суток перед глазами уже не «висит» и очередь не
+        блокирует.
+    """
+    stmt = (
+        select(DeliveryLog.word_id)
+        .where(
+            DeliveryLog.user_id == user.id,
+            DeliveryLog.answered_at.is_(None),
+        )
+        .distinct()
+    )
+    if since is not None:
+        stmt = stmt.where(DeliveryLog.sent_at >= since)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
 async def fetch_last_delivered_word_id(session: AsyncSession, user: User) -> int | None:
     """Слово из самой последней отправки пользователю (даже если на неё ответили)."""
     result = await session.execute(
@@ -619,7 +678,8 @@ async def count_pending_review_user_words(
     :param not_shown_since: если задано, уже показанные с этого момента слова не
         считаются — кроме тех, на которые с тех пор ответили: «не знаю» возвращает
         слово на этап 0, и оно должно прийти снова (см.
-        :func:`fetch_due_user_words`). Карточка, отправленная после последнего
+        :func:`waiting_for_repeat_condition` — по этому же условию очередь
+        повторений отдаёт слова). Карточка, отправленная после последнего
         ответа, план не занимает: слово уже в чате у пользователя, заново его
         планировать не нужно. Поэтому каждая отправка (в том числе кнопкой
         «🎲 Слово») уменьшает план дня, а интервал до следующего слова растёт
@@ -640,15 +700,7 @@ async def count_pending_review_user_words(
     if not_shown_since is not None:
         last_sent = last_sent_subquery(user)
         stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
-            or_(
-                last_sent.c.last_sent_at.is_(None),
-                last_sent.c.last_sent_at < not_shown_since,
-                and_(
-                    UserWord.last_reviewed_at.is_not(None),
-                    UserWord.last_reviewed_at >= not_shown_since,
-                    UserWord.last_reviewed_at >= last_sent.c.last_sent_at,
-                ),
-            )
+            waiting_for_repeat_condition(last_sent, not_shown_since)
         )
     condition = build_pos_filter_condition(pos_values)
     if condition is not None:

@@ -282,6 +282,62 @@ async def test_due_queue_skips_words_shown_today(session, user, words, now) -> N
     assert {item.word.word for item in not_today} == {"quickly", "curious"}
 
 
+async def test_due_queue_returns_word_answered_after_card(session, user, words, now) -> None:
+    """Слово, на которое ответили после карточки, снова попадает в очередь.
+
+    Регрессия: ``not_shown_since`` смотрел только на отправку, а не на ответ —
+    поэтому слово, закрытое «не знаю» (этап 0 — срок повторения наступил сразу), в
+    план дня возвращалось, а очередь показать его не могла. Каждый выбор упирался в
+    самое просроченное слово, и одно и то же слово приходило снова и снова.
+    """
+    day_start = now - timedelta(hours=12)
+    # apple: карточка висит без ответа — с прошлого показа прогресс не менялся.
+    hanging = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        hanging,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(hours=3),
+        last_reviewed_at=now - timedelta(hours=5),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=now - timedelta(hours=1)
+    )
+    # quickly: ответ пришёл уже после отправки — слово снова ждёт показа.
+    answered = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        answered,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(hours=3),
+        last_reviewed_at=now - timedelta(minutes=30),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    await repository.create_delivery(
+        session, user.id, words[1].id, sent_at=now - timedelta(hours=2)
+    )
+
+    due = await repository.fetch_due_user_words(
+        session, user, now, 10, not_shown_since=day_start
+    )
+    pending = await repository.count_pending_review_user_words(
+        session, user, now, not_shown_since=day_start
+    )
+
+    assert [item.word.word for item in due] == ["quickly"]
+    # План дня считает ровно те слова, которые очередь может показать: разойдись
+    # они — план перестанет убывать от отправок, и интервал до следующего слова
+    # будет только сокращаться (см. :mod:`services.plan`).
+    assert pending == 1
+
+
 async def test_due_queue_prefers_longest_waiting(session, user, words, now) -> None:
     """При одинаковом сроке первым идёт слово, которое дольше ждало показа.
 
@@ -337,6 +393,32 @@ async def test_shown_word_ids_can_be_limited_by_date(session, user, words, now) 
             session, user, since=now - timedelta(hours=12)
         )
     ) == {words[1].id, words[2].id}
+
+
+async def test_unanswered_word_ids_are_only_hanging_cards(session, user, words, now) -> None:
+    """Среди отправок без ответа остаются только сегодняшние висящие карточки.
+
+    Слово, на которое ответили, прогресс получило и очередь его повторять может, а
+    карточка прошлых суток перед глазами уже не «висит» — исключать её значило бы
+    отодвигать слово, пока на неё не ответят (см.
+    :func:`services.word_selector.hanging_card_word_ids`).
+    """
+    await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
+    answered = await repository.create_delivery(session, user.id, words[1].id, sent_at=now)
+    await repository.mark_delivery_answered(
+        session, answered, config.ANSWER_KNOW, answered_at=now
+    )
+    await repository.create_delivery(
+        session, user.id, words[2].id, sent_at=now - timedelta(hours=30)
+    )
+
+    everything = await repository.fetch_unanswered_word_ids_since(session, user)
+    today = await repository.fetch_unanswered_word_ids_since(
+        session, user, since=now - timedelta(hours=12)
+    )
+
+    assert set(everything) == {words[0].id, words[2].id}
+    assert set(today) == {words[0].id}
 
 
 async def test_delivery_log_stats_reflect_journal_size(session, user, words, now) -> None:
