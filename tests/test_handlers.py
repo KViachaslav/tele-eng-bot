@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -37,8 +38,8 @@ from handlers import start as start_handlers
 from handlers import word_actions
 from keyboards import inline as keyboards
 from keyboards.callbacks import AnswerCallback, AudioCallback, SettingsCallback, ShowCallback
-from services import audio, delivery
-from services.message_builder import escape_text
+from services import audio, delivery, translator
+from services.message_builder import escape_text, spoiler
 
 
 class FakeBot:
@@ -238,6 +239,24 @@ def make_mp3(audio_dir: Path, accent: str, word: str) -> Path:
 def alerts_from(bot: FakeBot) -> list[AnswerCallbackQuery]:
     """Ответы на нажатия (``callback.answer``) в порядке вызова."""
     return [method for method in bot.methods if isinstance(method, AnswerCallbackQuery)]
+
+
+class StubTranslation:
+    """Заглушка ``translator.request_translation``: один и тот же ответ на любую строку.
+
+    Перевод по умолчанию выключен (:func:`tests.conftest.translation_off`), а
+    тесты про русские строки включают его обратно и подставляют эту заглушку:
+    так проверяется вся цепочка «хендлер → перевод → карточка», но без сети.
+    """
+
+    def __init__(self, translated: str) -> None:
+        self.translated = translated
+        self.queries: list[str] = []
+
+    async def __call__(self, text: str, timeout: float | None = None) -> dict[str, Any]:
+        """Ответ MyMemory: `translated` считается переводом любой строки."""
+        self.queries.append(text)
+        return {"responseStatus": 200, "responseData": {"translatedText": self.translated}}
 
 
 async def test_deliver_main_word_creates_record_and_show_button(session, user, words) -> None:
@@ -699,6 +718,136 @@ async def test_on_audio_sends_american_accent(session, user, words, audio_dir) -
     )
 
 
+async def test_card_shows_russian_lines_under_spoiler(
+    session, user, words, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Показ слова переводит определение и пример и прячет их под спойлер."""
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
+    request = StubTranslation("круглый плод")
+    monkeypatch.setattr(translator, "request_translation", request)
+    bot = FakeBot()
+
+    assert await delivery.deliver_main_word(bot, session, user) is True
+
+    text = bot.sent[0]["text"]
+    # Перевод один и тот же (заглушка), поэтому русских строк в карточке две:
+    # под определением и под примером — обе под спойлером.
+    hidden = f"{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}"
+    assert text.count(hidden) == 2
+    assert f"{texts.LABEL_DEFINITION}" in text
+    assert f"{texts.LABEL_EXAMPLE}" in text
+
+
+async def test_on_show_adds_spoiled_russian_lines(
+    session, user, words, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """«Показать» дописывает русские версии определения и примера под спойлером.
+
+    Слово приходит без перевода (режим «сначала слово, потом перевод»), а после
+    нажатия кнопки под английскими строками появляются русские — и в сеть за ними
+    ходят один раз: второе нажатие берёт перевод из базы.
+    """
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
+    request = StubTranslation("круглый плод")
+    monkeypatch.setattr(translator, "request_translation", request)
+    bot = FakeBot()
+    assert await delivery.deliver_main_word(bot, session, user) is True
+    show_data = show_data_from(bot)
+
+    await word_actions.on_show(
+        callback=make_callback(show_data.pack(), bot), callback_data=show_data, session=session
+    )
+
+    hidden = f"{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}"
+    revealed = bot.edits[-1]["text"]
+    assert revealed.count(hidden) == 2
+    asked = list(request.queries)
+
+    await word_actions.on_show(
+        callback=make_callback(show_data.pack(), bot), callback_data=show_data, session=session
+    )
+
+    assert bot.edits[-1]["text"] == revealed
+    assert request.queries == asked
+
+
+async def test_on_audio_caption_hides_russian_definition(
+    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """В подписи к озвучке русское определение идёт второй строкой под спойлером."""
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
+    request = StubTranslation("круглый плод")
+    monkeypatch.setattr(translator, "request_translation", request)
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    caption = bot.voices[0]["caption"]
+    assert caption.startswith(texts.render_audio_caption(words[0].word, config.AUDIO_ACCENT_UK))
+    assert caption.endswith(f"{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}")
+    saved = await repository.get_word_by_id(session, words[0].id)
+    assert saved is not None
+    assert saved.russian_definition == "круглый плод"
+
+
+async def test_on_audio_caption_skips_hidden_definition(
+    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Кто скрыл определение в карточке, не видит его и в подписи к озвучке."""
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
+    request = StubTranslation("круглый плод")
+    monkeypatch.setattr(translator, "request_translation", request)
+    user_settings = await repository.get_or_create_user_settings(session, user)
+    await repository.update_user_settings(session, user_settings, show_definition=False)
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert bot.voices[0]["caption"] == texts.render_audio_caption(
+        words[0].word, config.AUDIO_ACCENT_UK
+    )
+
+
+async def test_on_audio_caption_stays_english_without_translation(
+    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сервис перевода недоступен: подпись к озвучке выходит как раньше."""
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
+
+    async def failing_request(text: str, timeout: float | None = None) -> None:
+        return None
+
+    monkeypatch.setattr(translator, "request_translation", failing_request)
+    sent = await repository.create_delivery(session, user.id, words[0].id)
+    data = AudioCallback(
+        word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
+    )
+    make_mp3(audio_dir, config.AUDIO_ACCENT_UK, words[0].word)
+    bot = FakeBot()
+
+    await word_actions.on_audio(
+        callback=make_callback(data.pack(), bot), callback_data=data, session=session
+    )
+
+    assert bot.voices[0]["caption"] == texts.render_audio_caption(
+        words[0].word, config.AUDIO_ACCENT_UK
+    )
+
+
 async def test_on_audio_does_not_fall_back_to_other_accent(
     session, user, words, audio_dir
 ) -> None:
@@ -1006,11 +1155,14 @@ async def test_on_demand_skips_word_from_chat(session, user, words) -> None:
     assert word_ids_from(bot)[1] != waiting_id
 
 
-async def test_on_demand_repeats_only_without_alternatives(session, user, words) -> None:
-    """Повтор возможен, только когда других слов в очереди не осталось.
+async def test_on_demand_does_not_repeat_shown_word(session, user, words) -> None:
+    """Слово, которое уже приходило сегодня, ручной запрос не повторяет.
 
-    Фильтр по части речи оставляет пользователю одно слово, поэтому после ответа
-    «не знаю» (этап 0 — слово снова «на сегодня») выбор падает на него же.
+    Регрессия: ответ «не знаю» возвращает слово на этап 0 (срок повторения уже
+    наступил), поэтому кнопка «🎲 Слово» присылала то же самое слово снова и
+    снова. Фильтр по части речи оставляет пользователю одно слово, и других
+    вариантов в очереди нет — тогда отправки не будет, а хендлер объяснит причину
+    вместо повтора карточки.
     """
     await repository.set_pos_filter(session, user, {config.POS_NOUN})
     bot = FakeBot()
@@ -1029,9 +1181,58 @@ async def test_on_demand_repeats_only_without_alternatives(session, user, words)
         scheduler=StubScheduler(),
     )
 
-    assert await delivery.deliver_on_demand(bot, session, user) is True
+    assert await delivery.deliver_on_demand(bot, session, user) is False
+    assert word_ids_from(bot) == [show_data.word_id]
 
-    assert word_ids_from(bot) == [show_data.word_id, show_data.word_id]
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=StubScheduler(),
+    )
+
+    assert sent_texts(bot) == [texts.WORD_SHOWN_TODAY]
+
+
+async def test_two_presses_at_once_get_different_words(session, user, words) -> None:
+    """Два одновременных запроса слова не повторяют одно и то же слово.
+
+    Регрессия: в журнале ``delivery_log`` нашлись пары строк с одинаковым словом
+    и одинаковым ``sent_at`` (30.09.2026: ``abandon`` дважды в 10:36:00,
+    ``abandoned`` в 10:41:01 и 10:41:02). Слово выбирается по журналу, а решение
+    принимается до записи в него, поэтому два запроса успевали выбрать одно
+    слово. Отправки пользователя идут под замком (:func:`delivery.user_send_lock`),
+    и каждая следующая видит журнал предыдущей.
+    """
+    bot = FakeBot()
+
+    results = await asyncio.gather(
+        delivery.deliver_on_demand(bot, session, user),
+        delivery.deliver_on_demand(bot, session, user),
+    )
+
+    assert results == [True, True]
+    first, second = word_ids_from(bot)
+    assert first != second
+
+
+async def test_press_during_scheduled_slot_gets_other_word(session, user, words) -> None:
+    """Нажатие «🎲 Слово» во время слота планировщика берёт другое слово.
+
+    Слот и кнопка работают с разными сессиями (планировщик — ``session_scope``,
+    хендлер — сессия апдейта), поэтому одной проверки «слово показано» мало:
+    нажатие не должно пересечься со слотом в принципе.
+    """
+    bot = FakeBot()
+
+    await asyncio.gather(
+        delivery.deliver_slot(bot, session, user),
+        delivery.deliver_on_demand(bot, session, user),
+    )
+
+    word_ids = word_ids_from(bot)
+    assert len(word_ids) == 2
+    assert word_ids[0] != word_ids[1]
 
 
 # ---------------------------------------------------------------------------

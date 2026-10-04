@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, time, timezone
+from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
@@ -146,16 +147,58 @@ class Word(Base):
 
     __tablename__ = "words"
 
+    #: Пары «английское поле → его русская версия»: именно эти строки переводит
+    #: MyMemory (:mod:`services.translator`), и в этом порядке — сначала
+    #: определение, потом пример.
+    TRANSLATION_FIELDS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("definition", "russian_definition"),
+        ("example", "russian_example"),
+    )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     word: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     definition: Mapped[str | None] = mapped_column(Text)
+    #: Русские версии определения и примера (MyMemory, :mod:`services.translator`):
+    #: заполняются один раз при первом показе слова и лежат рядом со статьёй.
+    russian_definition: Mapped[str | None] = mapped_column(Text)
     russian_translation: Mapped[str | None] = mapped_column(Text)
     example: Mapped[str | None] = mapped_column(Text)
+    russian_example: Mapped[str | None] = mapped_column(Text)
     part_of_speech: Mapped[str | None] = mapped_column(String(64))
     related_forms: Mapped[str | None] = mapped_column(Text)
     synonyms: Mapped[str | None] = mapped_column(Text)
     antonyms: Mapped[str | None] = mapped_column(Text)
     collocations: Mapped[str | None] = mapped_column(Text)
+
+
+#: Значение ``field`` в :func:`translation_field_pairs` — «оба поля статьи».
+TRANSLATION_BOTH = "both"
+
+#: Имена полей для аргумента ``--field`` пакетного перевода: ``both`` любой из
+#: ``Word.TRANSLATION_FIELDS``.
+TRANSLATION_FIELD_CHOICES: tuple[str, ...] = (
+    TRANSLATION_BOTH,
+    *(source for source, _ in Word.TRANSLATION_FIELDS),
+)
+
+
+def translation_field_pairs(field: str = TRANSLATION_BOTH) -> tuple[tuple[str, str], ...]:
+    """Пары «английское поле → его русская версия» для выбранных полей статьи.
+
+    Соответствие полей общее для выборки недопереведённых слов
+    (:mod:`db.repository`) и для записи самих переводов
+    (:mod:`services.translator`), поэтому живёт рядом с моделью.
+
+    :param field: ``both`` — определение и пример, иначе имя одного поля
+        (``definition`` или ``example``).
+    :raises ValueError: если имя поля неизвестно.
+    """
+    if field == TRANSLATION_BOTH:
+        return Word.TRANSLATION_FIELDS
+    for pair in Word.TRANSLATION_FIELDS:
+        if pair[0] == field:
+            return (pair,)
+    raise ValueError(f"Неизвестное поле перевода: {field!r}")
 
 
 class UserWord(Base):

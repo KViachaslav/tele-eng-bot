@@ -1,6 +1,10 @@
 """Сборка текста карточки слова (формат из раздела 5 ТЗ).
 
 Перевод прячется спойлером Telegram (``||текст||``) или показывается по кнопке.
+Русские переводы определения и примера (``words.russian_definition`` и
+``words.russian_example``, см. :mod:`services.translator`) идут сразу под своими
+английскими строками и **всегда** под спойлером: даже когда перевод слова уже
+открыт, смысл определения сначала стоит вспомнить самому.
 Все значения из CSV экранируются для MarkdownV2 — иначе символы вроде ``.``,
 ``-`` или ``!`` сломали бы разметку.
 """
@@ -24,6 +28,18 @@ def _line(label: str, value: str | None, *, placeholder: bool = False) -> str:
     if value:
         return f"{label} {escape_text(value)}"
     return f"{label} {config.EMPTY_VALUE_MARKER}" if placeholder else ""
+
+
+def _spoiled_line(label: str, value: str | None) -> str:
+    """Строка карточки со скрытым значением: ``label ||значение||``.
+
+    Так выводятся русские версии определения и примера: строка стоит под своей
+    английской парой, но текст прячется спойлером, поэтому прочитать перевод
+    можно только осознанно — нажатием на спойлер.
+    """
+    if not value:
+        return ""
+    return f"{label} {spoiler(escape_text(value))}"
 
 
 def build_word_card(
@@ -59,8 +75,10 @@ def build_word_card(
     lines: list[str] = []
     if settings.show_definition:
         lines.append(_line(texts.LABEL_DEFINITION, word.definition))
+        lines.append(_spoiled_line(texts.LABEL_RU, word.russian_definition))
     if settings.show_example:
         lines.append(_line(texts.LABEL_EXAMPLE, word.example))
+        lines.append(_spoiled_line(texts.LABEL_RU, word.russian_example))
     # Часть речи и Related Forms по умолчанию не выводятся (раздел 5 ТЗ),
     # но их можно включить в /settings — тогда строки добавляются.
     if settings.show_pos:
@@ -95,3 +113,23 @@ def build_refresh_card(
 def with_answer_result(card: str, result_text: str) -> str:
     """Добавляет к карточке результат ответа (текст тоже экранируется)."""
     return f"{card}\n\n{escape_text(result_text)}"
+
+
+def build_audio_caption(
+    word: str,
+    accent: str,
+    *,
+    russian_definition: str | None = None,
+) -> str:
+    """Подпись к голосовому сообщению с озвучкой: слово, акцент и перевод определения.
+
+    Определение уходит отдельной строкой под спойлером (``🇷🇺 ||...||``) — его
+    видно, только если пользователь сам раскроет спойлер: спойлер работает в
+    подписи к голосовому сообщению так же, как в обычном тексте. Если русского
+    перевода нет, подпись остаётся прежней: слово и акцент.
+    """
+    lines = [
+        escape_text(texts.render_audio_caption(word, accent)),
+        _spoiled_line(texts.LABEL_RU, russian_definition),
+    ]
+    return "\n".join(line for line in lines if line)

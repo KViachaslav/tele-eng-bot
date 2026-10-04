@@ -23,7 +23,7 @@ from db.models import DeliveryLog, User, Word, utcnow
 from handlers import common
 from keyboards.callbacks import AnswerCallback, AudioCallback, ShowCallback
 from keyboards.inline import answer_keyboard, audio_keyboard
-from services import audio, delivery, srs
+from services import audio, delivery, srs, translator
 from services.message_builder import build_refresh_card, build_word_card, with_answer_result
 from services.scheduler import SchedulerService
 
@@ -37,10 +37,16 @@ async def _card_text(
     *,
     revealed: bool = True,
 ) -> str:
-    """Карточка слова с учётом полей пользователя и режима показа."""
+    """Карточка слова с учётом полей пользователя и режима показа.
+
+    Перед сборкой текста дозаполняются русские переводы определения и примера
+    (:mod:`services.translator`) — в карточке они идут под английскими строками
+    под спойлером. Если словарь уже переведён, лишних запросов не будет.
+    """
     settings = await repository.get_or_create_user_settings(session, user)
     user_word = await repository.get_user_word(session, user.id, word.id)
     is_refresh = user_word is not None and bool(user_word.is_refresh)
+    await translator.ensure_word_translations(session, word)
     builder = build_refresh_card if is_refresh else build_word_card
     return builder(word, settings, reveal_mode=user.reveal_mode, revealed=revealed)
 
@@ -176,7 +182,9 @@ async def on_audio(
     Акцент приходит в ``callback_data`` кнопки, файл ищется в ``data/<акцент>``
     (см. :mod:`services.audio`): озвучен не весь словарь, поэтому для слова без
     файла приходит алерт, а сообщение с карточкой не меняется — ответ на слово
-    по-прежнему можно дать.
+    по-прежнему можно дать. В подпись к голосовому сообщению добавляется русское
+    определение слова под спойлером — послушав слово, можно проверить, помнишь ли
+    ты его смысл.
     """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
@@ -189,22 +197,29 @@ async def on_audio(
         await callback.answer(texts.render_delivery_not_found(), show_alert=True)
         return
 
-    word = delivery_log.word.word
+    word = delivery_log.word
     accent = callback_data.accent
-    path = audio.find_audio(word, accent)
+    path = audio.find_audio(word.word, accent)
     if path is None:
-        logger.info("Озвучки {!r} для слова {!r} нет в {}", accent, word, config.AUDIO_DIR)
+        logger.info("Озвучки {!r} для слова {!r} нет в {}", accent, word.word, config.AUDIO_DIR)
         await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
         return
 
-    if not await audio.send_word_audio(callback.message, word, path, accent):
+    # В подписи к голосовому сообщению русское определение появляется только у
+    # тех, кто вообще видит определение в карточке (поля настраиваются в /settings).
+    settings = await repository.get_or_create_user_settings(session, user)
+    await translator.ensure_word_translations(session, word)
+    definition_ru = word.russian_definition if settings.show_definition else None
+    if not await audio.send_word_audio(
+        callback.message, word.word, path, accent, russian_definition=definition_ru
+    ):
         await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
         return
 
     logger.info(
         "Пользователю {} отправлена озвучка слова {!r} ({})",
         user.telegram_id,
-        word,
+        word.word,
         accent,
     )
     await callback.answer()

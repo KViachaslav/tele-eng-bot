@@ -24,7 +24,9 @@
 Файл уходит голосовым сообщением (``sendVoice``): в чате видно сообщение с
 волной, которое можно послушать сразу, не открывая вложение. Telegram сам
 конвертирует mp3 из архива в формат голосовых (OGG/OPUS), поэтому ни ffmpeg, ни
-второй копии файлов на диске не нужно; акцент указан в подписи.
+второй копии файлов на диске не нужно; акцент указан в подписи. Если у слова уже
+есть русский перевод определения, он добавляется в подпись второй строкой под
+спойлером (``services/message_builder.build_audio_caption``).
 """
 from __future__ import annotations
 
@@ -38,7 +40,7 @@ from aiogram.types import FSInputFile, MaybeInaccessibleMessage, Message
 from loguru import logger
 
 import config
-import locales.ru as texts
+from services.message_builder import build_audio_caption
 
 #: Хвост «(1)», «(2)» в имени файла — так распаковка архива пометила повторы.
 DUPLICATE_SUFFIX = re.compile(r"\(\d+\)$")
@@ -147,14 +149,21 @@ async def send_word_audio(
     word: str,
     path: Path,
     accent: str,
+    *,
+    russian_definition: str | None = None,
 ) -> bool:
     """Отправляет озвучку голосовым сообщением в тот же чат, где нажали кнопку.
 
     Файл уходит как голосовое (``sendVoice``), а не как аудиофайл: у голосового
     нет полей ``title``/``performer``, зато оно играет прямо в чате. Telegram сам
     конвертирует mp3 в OGG/OPUS. Подпись сообщает акцент, потому что в самом
-    сообщении больше нечего показать кроме волны.
+    сообщении больше нечего показать кроме волны; если у слова есть русский
+    перевод определения, он идёт второй строкой под спойлером (см.
+    :func:`services.message_builder.build_audio_caption`) — послушав слово, можно
+    подсмотреть смысл, когда он нужен.
 
+    :param russian_definition: русский перевод определения слова (или ``None``) —
+        передаётся, только если определение вообще показывается пользователю.
     :return: ``False``, если сообщение недоступно или Telegram отклонил файл —
         тогда вызывающий код отвечает пользователю алертом.
     """
@@ -164,7 +173,8 @@ async def send_word_audio(
     try:
         await message.answer_voice(
             FSInputFile(path),
-            caption=texts.render_audio_caption(word, accent),
+            caption=build_audio_caption(word, accent, russian_definition=russian_definition),
+            parse_mode=config.PARSE_MODE,
         )
     except TelegramAPIError:
         logger.exception("Не удалось отправить озвучку {!r} ({})", word, path)

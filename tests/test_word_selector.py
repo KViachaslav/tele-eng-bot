@@ -155,8 +155,25 @@ async def test_on_demand_exclusions_skip_only_todays_cards(session, user, words,
     assert words[0].id not in skipped
 
 
+async def test_on_demand_exclusions_skip_word_answered_today(session, user, words, now) -> None:
+    """Слово, на которое сегодня ответили «не знаю», в ручной запрос не вернётся.
+
+    Регрессия: ответ обнуляет срок повторения (этап 0 — слово снова «на сегодня»),
+    а исключалась только самая последняя отправка — поэтому ``/word`` ходил по
+    кругу из двух-трёх слов, которые пользователь только что ответил.
+    """
+    delivery_log = await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
+    await repository.mark_delivery_answered(
+        session, delivery_log, config.ANSWER_DONT_KNOW, answered_at=now
+    )
+
+    skipped = await word_selector.on_demand_exclusions(session, user, now)
+
+    assert words[0].id in skipped
+
+
 async def test_on_demand_exclusions_skip_last_delivered_word(session, user, words, now) -> None:
-    """Последнее отправленное слово тоже исключается, даже если на него ответили."""
+    """Последнее отправленное слово исключается, даже если оно из прошлого дня."""
     delivery = await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
     await repository.mark_delivery_answered(
         session, delivery, config.ANSWER_DONT_KNOW, answered_at=now
@@ -165,3 +182,28 @@ async def test_on_demand_exclusions_skip_last_delivered_word(session, user, word
     skipped = await word_selector.on_demand_exclusions(session, user, now)
 
     assert skipped == {words[0].id}
+
+
+# ---------------------------------------------------------------------------
+# Пустая очередь: есть ли слово вообще
+# ---------------------------------------------------------------------------
+async def test_has_candidate_word_sees_word_shown_today(session, user, words, now) -> None:
+    """Слово показывали сегодня — очередь пуста именно из-за показа.
+
+    Фильтр по части речи оставляет одно слово: новых слов нет, а оно уже в чате.
+    Так бот понимает, что причина пустого ``/word`` — сегодняшние отправки, и
+    говорит об этом пользователю (см. :func:`handlers.common.no_word_text`).
+    """
+    await repository.set_pos_filter(session, user, {config.POS_NOUN})
+    await put_in_learning(session, user.id, words[0].id, now, hours_ago=1)
+    await show_word(session, user, words[0].id, now)
+
+    assert await word_selector.has_candidate_word(session, user, now) is True
+
+
+async def test_has_candidate_word_false_without_words(session, user, words, now) -> None:
+    """Ни одного кандидата: слов нет по настройкам, а не из-за сегодняшних показов."""
+    await repository.update_user(session, user, words_per_day=1)
+    await show_word(session, user, words[0].id, now)
+
+    assert await word_selector.has_candidate_word(session, user, now) is False

@@ -1,11 +1,13 @@
 """Общие фикстуры тестов: временная база SQLite, пользователь и слова.
 
 Каждый тест получает чистую базу в ``tmp_path``, поэтому тесты не зависят от
-рабочего ``bot.db`` и не влияют друг на друга.
+рабочего ``bot.db`` и не влияют друг на друга. Здесь же перевод через MyMemory
+по умолчанию выключен: тесты не должны ходить в интернет (см.
+:func:`translation_off`).
 """
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -13,9 +15,11 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import config
 import database
 from db import repository
 from db.models import User, Word
+from services import translator
 
 #: Словарные статьи для тестов: noun, adverb, adjective.
 WORD_ROWS: tuple[dict[str, str | None], ...] = (
@@ -53,6 +57,21 @@ WORD_ROWS: tuple[dict[str, str | None], ...] = (
         "collocations": None,
     },
 )
+
+
+@pytest.fixture(autouse=True)
+def translation_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Выключает перевод через MyMemory на время теста.
+
+    Словарь приходит на английском, и русские строки дозапрашиваются у сервиса
+    (:mod:`services.translator`): в тестах такой поход в сеть сделал бы результат
+    зависимым от интернета и от дневного лимита MyMemory. Тесты самого перевода
+    включают его обратно и подменяют сетевой вызов (см. ``tests/test_translator.py``).
+    """
+    monkeypatch.setattr(config.get_settings(), "translation_enabled", False)
+    translator.reset_cooldown()
+    yield
+    translator.reset_cooldown()
 
 
 @pytest.fixture

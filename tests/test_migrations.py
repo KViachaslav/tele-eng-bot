@@ -85,6 +85,66 @@ async def test_ensure_columns_skips_existing_column(tmp_path: Path) -> None:
         await engine.dispose()
 
 
+#: Таблица ``words`` в том виде, в каком она была до появления русских переводов
+#: (те же колонки, что в ``db/models.py``, но без ``russian_definition`` /
+#: ``russian_example``).
+OLD_WORDS_DDL = (
+    "CREATE TABLE words ("
+    "id INTEGER PRIMARY KEY, "
+    "word VARCHAR(128) NOT NULL UNIQUE, "
+    "definition TEXT, "
+    "russian_translation TEXT, "
+    "example TEXT, "
+    "part_of_speech VARCHAR(64), "
+    "related_forms TEXT, "
+    "synonyms TEXT, "
+    "antonyms TEXT, "
+    "collocations TEXT)"
+)
+
+OLD_WORD_INSERT = (
+    "INSERT INTO words (word, definition, example) "
+    "VALUES ('apple', 'a round fruit', 'She ate an apple.')"
+)
+
+
+async def test_ensure_columns_adds_russian_translations(tmp_path: Path) -> None:
+    """Старые ``words`` получают колонки под русские переводы (пока пустые)."""
+    engine = _engine(tmp_path / "old_words.db")
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(OLD_WORDS_DDL))
+            await connection.execute(text(OLD_WORD_INSERT))
+
+        async with engine.begin() as connection:
+            assert await migrations.ensure_columns(connection) == [
+                "words.russian_definition",
+                "words.russian_example",
+            ]
+
+        async with engine.begin() as connection:
+            # Повторный запуск ничего не меняет: схема уже актуальна.
+            assert await migrations.ensure_columns(connection) == []
+            row = (
+                await connection.execute(
+                    text("SELECT russian_definition, russian_example FROM words")
+                )
+            ).one()
+            assert tuple(row) == (None, None)
+    finally:
+        await engine.dispose()
+
+
+async def test_ensure_columns_skips_missing_table(tmp_path: Path) -> None:
+    """Таблицы в базе ещё нет: колонки не добавляются (её создаст ``create_all``)."""
+    engine = _engine(tmp_path / "empty.db")
+    try:
+        async with engine.begin() as connection:
+            assert await migrations.ensure_columns(connection) == []
+    finally:
+        await engine.dispose()
+
+
 async def test_init_database_upgrades_old_schema(tmp_path: Path) -> None:
     """``init_database`` сам обновляет базу со старой схемой."""
     path = tmp_path / "bot.db"

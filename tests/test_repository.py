@@ -307,10 +307,12 @@ async def test_due_queue_prefers_longest_waiting(session, user, words, now) -> N
     assert [item.word.word for item in found] == ["curious", "quickly", "apple"]
 
 
-async def test_open_deliveries_can_be_limited_by_date(session, user, words, now) -> None:
-    """Карточка без ответа из прошлого не висит в чате вечно.
+async def test_shown_word_ids_can_be_limited_by_date(session, user, words, now) -> None:
+    """Показанные сегодня слова исключаются, вчерашняя карточка — уже нет.
 
-    Иначе слово навсегда выпадало из очереди ручного запроса ``/word``.
+    Иначе слово, чью карточку пользователь не закрыл накануне, выпадало из
+    очереди ручного запроса ``/word`` навсегда, а слово, на которое только что
+    ответили «не знаю», этим же запросом возвращалось в чат.
     """
     await repository.create_delivery(
         session, user.id, words[0].id, sent_at=now - timedelta(hours=30)
@@ -325,15 +327,16 @@ async def test_open_deliveries_can_be_limited_by_date(session, user, words, now)
         session, answered, config.ANSWER_KNOW, answered_at=now
     )
 
-    assert set(await repository.fetch_open_delivery_word_ids(session, user)) == {
+    assert set(await repository.fetch_shown_word_ids_since(session, user)) == {
         words[0].id,
         words[1].id,
+        words[2].id,
     }
     assert set(
-        await repository.fetch_open_delivery_word_ids(
+        await repository.fetch_shown_word_ids_since(
             session, user, since=now - timedelta(hours=12)
         )
-    ) == {words[1].id}
+    ) == {words[1].id, words[2].id}
 
 
 async def test_delivery_log_stats_reflect_journal_size(session, user, words, now) -> None:
@@ -524,4 +527,66 @@ async def test_count_started_words_since_counts_first_deliveries(
         await repository.count_started_words_since(session, user, now - timedelta(hours=12)) == 1
     )
     assert await repository.count_started_words_since(session, user, now - timedelta(days=2)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Пакетный перевод словаря: выборка слов, которым нужен русский текст
+# ---------------------------------------------------------------------------
+async def test_get_words_without_translations_skips_translated(session, words) -> None:
+    """Полностью переведённое слово из выборки уходит, частично переведённое — остаётся."""
+    await repository.save_word_translations(
+        session, words[0], russian_definition="круглый плод", russian_example="Она ела яблоко."
+    )
+    await repository.save_word_translations(session, words[1], russian_definition="быстро")
+
+    pending = await repository.get_words_without_translations(session)
+
+    assert [word.id for word in pending] == [words[1].id, words[2].id]
+
+
+async def test_get_words_without_translations_respects_field_and_limit(session, words) -> None:
+    """``field`` сужает выборку до одного поля, ``limit`` — до размера порции."""
+    await repository.save_word_translations(session, words[0], russian_definition="круглый плод")
+
+    by_definition = await repository.get_words_without_translations(session, field="definition")
+    by_example = await repository.get_words_without_translations(
+        session, field="example", limit=1
+    )
+
+    assert [word.id for word in by_definition] == [words[1].id, words[2].id]
+    assert [word.id for word in by_example] == [words[0].id]
+
+
+async def test_get_words_without_translations_prefers_learning(session, user, words) -> None:
+    """``learning_first`` поднимает вперёд слово, которое уже есть в планах изучения."""
+    await repository.get_or_create_user_word(session, user.id, words[2].id)
+
+    pending = await repository.get_words_without_translations(session, learning_first=True)
+
+    assert [word.id for word in pending] == [words[2].id, words[0].id, words[1].id]
+
+
+async def test_pending_translations_counts_words_and_chars(session, words) -> None:
+    """Отчёт считает слова и символы по тем строкам, которым перевод ещё нужен."""
+    await repository.save_word_translations(session, words[0], russian_definition="круглый плод")
+
+    pending = await repository.pending_translations(session)
+
+    assert pending.words == len(words)  # у первого слова не хватает только примера
+    assert pending.chars == len(words[0].example) + sum(
+        len(word.definition) + len(word.example) for word in words[1:]
+    )
+
+
+async def test_pending_translations_is_zero_for_translated_dictionary(session, words) -> None:
+    """Полностью переведённый словарь: переводить нечего."""
+    for word in words:
+        await repository.save_word_translations(
+            session, word, russian_definition="перевод", russian_example="перевод"
+        )
+
+    pending = await repository.pending_translations(session)
+
+    assert (pending.words, pending.chars) == (0, 0)
+    assert list(await repository.get_words_without_translations(session)) == []
 

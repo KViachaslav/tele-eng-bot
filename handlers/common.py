@@ -22,9 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 import locales.ru as texts
 from db import repository
-from db.models import User
+from db.models import User, utcnow
 from keyboards.reply import main_menu_keyboard
-from services import slots
+from services import slots, word_selector
 from services.scheduler import SchedulerService
 
 router = Router(name="common")
@@ -98,8 +98,16 @@ def parse_learning_limit(raw: str | None) -> int | None:
     return None
 
 
-async def no_word_text(session: AsyncSession, user: User) -> str:
-    """Почему слово не пришло: пустой словарь, лимит изучения или пустая очередь."""
+async def no_word_text(session: AsyncSession, user: User, now: datetime | None = None) -> str:
+    """Почему слово не пришло: пустой словарь, лимит в изучении, пустая очередь.
+
+    Отдельный случай — «всё уже приходило сегодня»: подходящие слова есть, но их
+    карточки уже уходили пользователю с начала его суток (ручной запрос ``/word``
+    не повторяет показанное, см.
+    :func:`services.word_selector.on_demand_exclusions`). Тогда честнее сказать об
+    этом прямо, чем отправлять «не нашёл подходящего слова» — которое намекает на
+    фильтр по части речи или на пустой словарь.
+    """
     if await repository.count_words(session) == 0:
         return texts.NO_WORDS_IN_DATABASE
 
@@ -111,6 +119,9 @@ async def no_word_text(session: AsyncSession, user: User) -> str:
                 limit=user.learning_limit,
                 stats=texts.CMD_STATS,
             )
+
+    if await word_selector.has_candidate_word(session, user, now or utcnow()):
+        return texts.WORD_SHOWN_TODAY
 
     return texts.WORD_NOT_FOUND
 

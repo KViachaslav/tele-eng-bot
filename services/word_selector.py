@@ -9,6 +9,10 @@
 показывали. Так очередь не зацикливается на слове, сброшенном на этап 0 ответом
 «не знаю» (у него срок повторения наступает сразу).
 
+Ручной запрос «дай слово» третьей ступенью не пользуется: слова, которые уже
+уходили сегодня, ему отдаёт :func:`on_demand_exclusions` — иначе одно нажатие
+возвращало бы в чат только что отвеченное слово (см. :mod:`services.delivery`).
+
 Новые слова выбираются **случайно** (а не по порядку загрузки словаря) и только
 пока слов «в изучении» меньше ``users.learning_limit`` и не израсходован дневной
 план ``users.words_per_day``: оба ограничения общие для рассылки по слотам и для
@@ -185,19 +189,35 @@ async def on_demand_exclusions(
 
     В набор попадают:
 
-    * слова, карточки которых висят в чате без ответа **с сегодняшнего дня**:
-      второе такое же слово только запутает. Карточка, отправленная вчера, уже не
-      «висит» — иначе слово выпало бы из очереди ``/word`` навсегда, как только
-      пользователь забудет на неё ответить (см.
-      :func:`services.slots.local_day_start_utc`);
-    * слово из самой последней отправки — после ответа «не знаю» его срок
-      повторения обнуляется (этап 0 = «в очередь на сегодня»), и без этого
-      исключения ``/word`` и кнопка «🎲 Слово» возвращали то же слово.
+    * все слова, карточки которых уходили **с сегодняшнего дня** — независимо от
+      того, ответил на них пользователь или нет. Ответ «не знаю» обнуляет срок
+      повторения (этап 0 — слово снова «на сегодня»), поэтому без этого правила
+      каждое нажатие «🎲 Слово» присылало то же слово, которое только что было в
+      чате. Карточка, отправленная вчера, уже не «висит» — иначе слово выпало бы
+      из очереди ``/word`` навсегда, как только пользователь забудет на неё
+      ответить (см. :func:`services.slots.local_day_start_utc`);
+    * слово из самой последней отправки — на случай, когда она была вчера.
     """
     moment = now or utcnow()
     day_start = slots.local_day_start_utc(user, moment)
-    skipped = set(await repository.fetch_open_delivery_word_ids(session, user, since=day_start))
+    skipped = set(await repository.fetch_shown_word_ids_since(session, user, since=day_start))
     last_word_id = await repository.fetch_last_delivered_word_id(session, user)
     if last_word_id is not None:
         skipped.add(last_word_id)
     return skipped
+
+
+async def has_candidate_word(session: AsyncSession, user: User, now: datetime) -> bool:
+    """Есть ли вообще слово, которое можно было бы отправить без исключений.
+
+    Нужно, чтобы объяснить пользователю пустую очередь: ``False`` — слов нет по
+    настройкам (фильтр по части речи, лимит в изучении, пустой словарь), а
+    ``True`` при пустом ``/word`` означает, что всё доступное уже приходило
+    сегодня (см. :func:`handlers.common.no_word_text`).
+    """
+    if await select_main_word(session, user, now) is not None:
+        return True
+    candidates = await repository.fetch_refresh_user_words(
+        session, user, now, 1, user.pos_filter_values
+    )
+    return bool(candidates)

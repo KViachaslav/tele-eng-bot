@@ -10,9 +10,11 @@ import config
 import locales.ru as texts
 from db.models import UserSettings, Word
 from services.message_builder import (
+    build_audio_caption,
     build_refresh_card,
     build_word_card,
     escape_text,
+    spoiler,
     with_answer_result,
 )
 
@@ -145,6 +147,69 @@ def test_word_without_translation_has_no_separator() -> None:
     head, _, body = card.partition("\n\n")
     assert head == escape_text("apple")
     assert texts.LABEL_DEFINITION in body
+
+
+def test_russian_lines_are_hidden_under_spoiler() -> None:
+    """Русские переводы идут под своими английскими строками и всегда под спойлером.
+
+    Спойлер остаётся даже в режиме «по кнопке», когда перевод слова уже показан:
+    смысл определения сначала стоит вспомнить самому.
+    """
+    word = make_word(
+        russian_definition="круглый плод",
+        russian_example="Она съела яблоко.",
+    )
+
+    card = build_word_card(
+        word, make_settings(*DEFAULT_FIELDS), reveal_mode=config.REVEAL_MODE_ON_BUTTON
+    )
+
+    definition = f"{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}"
+    example = f"{texts.LABEL_RU} {spoiler(escape_text('Она съела яблоко.'))}"
+    assert f"{texts.LABEL_DEFINITION} {escape_text(word.definition)}\n{definition}" in card
+    assert f"{texts.LABEL_EXAMPLE} {escape_text(word.example)}\n{example}" in card
+
+
+def test_russian_lines_are_absent_without_translation() -> None:
+    """Пока перевода нет, карточка выглядит как раньше — без русских строк."""
+    card = build_word_card(
+        make_word(), make_settings(*DEFAULT_FIELDS), reveal_mode=config.REVEAL_MODE_ON_BUTTON
+    )
+
+    assert texts.LABEL_RU not in card
+
+
+def test_russian_line_follows_its_own_field_switch() -> None:
+    """Перевод примера не показывается, если само поле примера выключено."""
+    word = make_word(
+        russian_definition="круглый плод",
+        russian_example="Она съела яблоко.",
+    )
+
+    card = build_word_card(
+        word, make_settings(config.FIELD_EXAMPLE), reveal_mode=config.REVEAL_MODE_ON_BUTTON
+    )
+
+    assert escape_text("круглый плод") not in card
+    assert escape_text("Она съела яблоко.") in card
+
+
+def test_audio_caption_adds_spoiled_russian_definition() -> None:
+    """В подписи к озвучке русское определение идёт второй строкой под спойлером."""
+    caption = build_audio_caption(
+        "apple", config.AUDIO_ACCENT_UK, russian_definition="круглый плод"
+    )
+
+    head = escape_text(texts.render_audio_caption("apple", config.AUDIO_ACCENT_UK))
+    assert caption == f"{head}\n{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}"
+
+
+def test_audio_caption_without_translation_stays_short() -> None:
+    """Без перевода подпись к озвучке — только слово и акцент."""
+    caption = build_audio_caption("apple", config.AUDIO_ACCENT_UK)
+
+    assert caption == escape_text(texts.render_audio_caption("apple", config.AUDIO_ACCENT_UK))
+    assert texts.LABEL_RU not in caption
 
 
 def test_refresh_card_adds_hint() -> None:

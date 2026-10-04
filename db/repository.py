@@ -15,7 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 import config
-from db.models import DeliveryLog, User, UserSettings, UserWord, Word, utcnow
+from db.models import (
+    TRANSLATION_BOTH,
+    DeliveryLog,
+    User,
+    UserSettings,
+    UserWord,
+    Word,
+    translation_field_pairs,
+    utcnow,
+)
 
 ModelT = TypeVar("ModelT")
 
@@ -54,6 +63,14 @@ class DeliveryLogStats:
 
     count: int = 0
     max_id: int = 0
+
+
+@dataclass(slots=True)
+class TranslationPending:
+    """Сколько словарю ещё нужно русского текста (:func:`pending_translations`)."""
+
+    words: int = 0
+    chars: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +178,104 @@ async def count_words(session: AsyncSession) -> int:
 async def get_word_by_id(session: AsyncSession, word_id: int) -> Word | None:
     """Словарная статья по идентификатору."""
     return await session.get(Word, word_id)
+
+
+async def save_word_translations(
+    session: AsyncSession,
+    word: Word,
+    **fields: str,
+) -> Word:
+    """Сохраняет русские переводы полей слова (``russian_definition``, ``russian_example``).
+
+    Перевод определения и примера приходит по сети (MyMemory, см.
+    :mod:`services.translator`) и складывается в саму статью: следующая карточка
+    этого слова берёт готовый текст, а не ходит в сервис заново.
+    """
+    return await _apply_fields(session, word, fields)
+
+
+def _has_text(column: ColumnElement[str]) -> ColumnElement[bool]:
+    """Условие «в колонке есть текст» (не ``NULL`` и не пустая строка)."""
+    return and_(column.is_not(None), column != "")
+
+
+def _blank(column: ColumnElement[str]) -> ColumnElement[bool]:
+    """Условие «в колонке нет текста» (``NULL`` или пустая строка)."""
+    return or_(column.is_(None), column == "")
+
+
+def _missing_pair_conditions(field: str) -> list[ColumnElement[bool]]:
+    """Условия «английский текст есть, а русского перевода ещё нет» по полям.
+
+    По одному условию на пару из :func:`db.models.translation_field_pairs`:
+    например, для ``both`` — определение без ``russian_definition`` или пример
+    без ``russian_example``.
+    """
+    return [
+        and_(_has_text(getattr(Word, source)), _blank(getattr(Word, target)))
+        for source, target in translation_field_pairs(field)
+    ]
+
+
+async def get_words_without_translations(
+    session: AsyncSession,
+    *,
+    limit: int | None = None,
+    field: str = TRANSLATION_BOTH,
+    learning_first: bool = False,
+) -> Sequence[Word]:
+    """Слова, которые ещё ждут русского текста (для пакетного перевода).
+
+    Пара к :func:`services.translator.translate_pending_words` и
+    ``scripts/translate_words.py``: у статьи есть английское поле
+    (``definition`` / ``example``), а его русская версия пуста — именно такие
+    строки бот дозапрашивает у MyMemory при первом показе.
+
+    Порядок — по ``Word.id``, чтобы порция шла предсказуемо и прогоны не
+    пересекались. ``learning_first`` поднимает вперёд слова из чьих-то планов
+    изучения (``user_words``): их пользователь увидит раньше, значит и русская
+    подсказка нужнее.
+
+    :param limit: сколько слов вернуть (``None`` — все).
+    :param field: какие поля считать непереведёнными (``both``, ``definition``,
+        ``example``).
+    :param learning_first: сначала слова, которые уже есть в планах изучения.
+    """
+    stmt = select(Word).where(or_(*_missing_pair_conditions(field)))
+    if learning_first:
+        # EXISTS вместо join: у слова может быть много планов, а строка нужна одна.
+        in_plans = select(UserWord.id).where(UserWord.word_id == Word.id).exists()
+        stmt = stmt.order_by(in_plans.desc(), Word.id)
+    else:
+        stmt = stmt.order_by(Word.id)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def pending_translations(
+    session: AsyncSession, *, field: str = TRANSLATION_BOTH
+) -> TranslationPending:
+    """Сколько слов ещё ждут русского текста и сколько символов нужно перевести.
+
+    Символы считаются по английским строкам: по этому числу видно, во сколько
+    суточных лимитов MyMemory (:data:`config.MYMEMORY_DAILY_CHARS_ANONYMOUS` /
+    :data:`config.MYMEMORY_DAILY_CHARS_WITH_EMAIL`) обойдётся остаток словаря.
+    """
+    pending = TranslationPending()
+    conditions = _missing_pair_conditions(field)
+    for (source, _target), condition in zip(translation_field_pairs(field), conditions):
+        chars = await session.scalar(
+            select(func.coalesce(func.sum(func.length(getattr(Word, source))), 0)).where(
+                condition
+            )
+        )
+        pending.chars += int(chars or 0)
+    pending.words = int(
+        await session.scalar(select(func.count()).select_from(Word).where(or_(*conditions))) or 0
+    )
+    return pending
 
 
 async def upsert_words(session: AsyncSession, rows: Sequence[Mapping[str, object]]) -> UpsertResult:
@@ -401,19 +516,24 @@ async def fetch_refresh_user_words(
     return result.scalars().all()
 
 
-async def fetch_open_delivery_word_ids(
+async def fetch_shown_word_ids_since(
     session: AsyncSession, user: User, since: datetime | None = None
 ) -> Sequence[int]:
-    """Слова, карточки которых отправлены, но ещё не отвечены («висят в чате»).
+    """Слова, карточки которых уже уходили пользователю не раньше ``since``.
 
-    :param since: если задано, учитываются только карточки, отправленные не раньше
-        этого момента. Старая карточка без ответа уже не «висит» перед глазами
-        пользователя, и из-за неё слово не должно выпадать из очереди навсегда
-        (см. :func:`services.word_selector.on_demand_exclusions`).
+    Ответ роли не играет: и карточка без ответа, и слово, на которое ответили
+    «не знаю» (этап 0 — срок повторения наступает сразу же), уже были в чате
+    сегодня. Показывать такое слово снова подряд нельзя, иначе ручной запрос
+    ``/word`` ходит по кругу одних и тех же слов (см.
+    :func:`services.word_selector.on_demand_exclusions`).
+
+    :param since: если задано, учитываются только отправки не раньше этого
+        момента. Карточка, оставшаяся без ответа накануне, из очереди не
+        выпадает: она уже не «висит» перед глазами пользователя.
     """
     stmt = (
         select(DeliveryLog.word_id)
-        .where(DeliveryLog.user_id == user.id, DeliveryLog.answer.is_(None))
+        .where(DeliveryLog.user_id == user.id)
         .distinct()
     )
     if since is not None:

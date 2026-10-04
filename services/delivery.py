@@ -3,11 +3,19 @@
 Используется планировщиком (слова по расписанию) и командой ``/word``.
 Здесь же определяется, какая клавиатура прикладывается к сообщению: в режиме
 «сначала слово, потом перевод» — кнопка «Показать», в режиме «всё сразу» —
-сразу «Знаю» / «Не знаю».
+сразу «Знаю» / «Не знаю». Перед сборкой карточки дозапрашиваются русские
+переводы определения и примера (:mod:`services.translator`): в тексте они идут
+под английскими строками под спойлером.
+
+Отправки одного пользователя сериализуются, а строка журнала ``delivery_log``
+фиксируется до отправки: иначе слот планировщика и нажатие «🎲 Слово» в одну
+секунду выбирали одно и то же слово (см. :func:`user_send_lock`).
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Collection
+from weakref import WeakKeyDictionary
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
@@ -19,6 +27,7 @@ import config
 from db import repository
 from db.models import User, UserSettings, utcnow
 from keyboards.inline import answer_keyboard, show_word_keyboard
+from services import translator
 from services.message_builder import build_refresh_card, build_word_card
 from services.word_selector import (
     SelectedWord,
@@ -30,6 +39,40 @@ from services.word_selector import (
 
 class UserUnreachable(RuntimeError):
     """Telegram не позволил отправить сообщение (бот заблокирован и т.п.)."""
+
+
+#: Замки «одна отправка слова на пользователя за раз»: цикл событий → ``users.id``
+#: → замок. ``asyncio.Lock`` привязывается к циклу событий при первом ожидании,
+#: поэтому ключ — пара (цикл, пользователь): у тестов свой цикл на каждый тест
+#: (``asyncio_default_fixture_loop_scope = function``), а в самом боте цикл один.
+_send_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Lock]] = (
+    WeakKeyDictionary()
+)
+
+
+def user_send_lock(user_id: int) -> asyncio.Lock:
+    """Замок, который пропускает к отправке по одному запросу на пользователя.
+
+    Слово выбирается по журналу ``delivery_log``, а решение принимается до того,
+    как в журнал попадёт строка. Поэтому одновременные запросы успевали выбрать
+    одно и то же слово: в базе 30.09.2026 есть пары строк с одинаковым ``sent_at``
+    и одинаковым ``word_id`` — кнопка «🎲 Слово» и слот планировщика сработали
+    в одну секунду. Замок сериализует такие отправки в процессе бота; каждая
+    следующая застаёт строку предыдущей в журнале и берёт другое слово.
+
+    Замки живут в памяти процесса: второй запущенный экземпляр бота решается не
+    этим, а своим токеном (иначе Telegram отдаёт апдейты только одному из них).
+    """
+
+    loop = asyncio.get_running_loop()
+    per_loop = _send_locks.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _send_locks[loop] = per_loop
+    lock = per_loop.get(user_id)
+    if lock is None:
+        lock = per_loop[user_id] = asyncio.Lock()
+    return lock
 
 
 def reveal_keyboard(user: User, word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
@@ -73,8 +116,18 @@ async def _deliver(
 ) -> bool:
     """Отправляет выбранное слово, логируя отправку в ``delivery_log``."""
     settings: UserSettings = await repository.get_or_create_user_settings(session, user)
+    # Русские переводы определения и примера нужны до сборки текста: в карточке
+    # они идут под своими английскими строками. Запрос к MyMemory случается
+    # только при первом показе слова — у переведённого дозаполнять нечего.
+    await translator.ensure_word_translations(session, selected.word)
     now = utcnow()
     delivery = await repository.create_delivery(session, user.id, selected.word.id, sent_at=now)
+    # Строку журнала фиксируем до отправки: по ней следующая отправка выбирает
+    # слово, а незафиксированную запись другая сессия (нажатие кнопки приходит со
+    # своей сессией, слот планировщика — со своей) не увидела бы и выбрала то же
+    # слово второй раз. Порядок «сначала журнал, потом отправка» делает факт
+    # показа слова видимым сразу после выбора.
+    await session.commit()
 
     if selected.is_refresh:
         card = build_refresh_card(selected.word, settings, reveal_mode=user.reveal_mode)
@@ -141,41 +194,39 @@ async def deliver_slot(bot: Bot, session: AsyncSession, user: User) -> int:
     """Одно «слово слота» плюс, если нужно, одно слово на освежение.
 
     Освежение идёт отдельным сообщением и не расходует дневной лимит слов.
+    Отправка идёт под замком пользователя (:func:`user_send_lock`): слот не
+    должен пересечься с нажатием «🎲 Слово» — иначе обе выбирают одно слово.
 
     :return: сколько сообщений со словами было отправлено.
     """
-    sent = 0
-    if await deliver_main_word(bot, session, user):
-        sent += 1
-    if await deliver_refresh_word(bot, session, user):
-        sent += 1
-    return sent
+    async with user_send_lock(user.id):
+        sent = 0
+        if await deliver_main_word(bot, session, user):
+            sent += 1
+        if await deliver_refresh_word(bot, session, user):
+            sent += 1
+        return sent
 
 
 async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool:
-    """Отправка по команде ``/word``: слово из основной очереди, иначе освежение.
+    """Отправка по команде ``/word``: слово, которого сегодня ещё не было в чате.
 
-    Сначала берём слово, которого у пользователя ещё нет в чате: ``/word`` и
-    кнопка «🎲 Слово» должны показывать разные слова. Внутри основной очереди
-    приоритет такой (см. :func:`services.word_selector.select_main_word`):
-    созревшие повторения, которых сегодня ещё не было, → новое слово → повторение
-    слова, которое сегодня уже показывали. Последний вариант появляется, только
-    когда других слов не осталось: у слова с наступившим сроком повторения он
-    остаётся наступившим до ответа, а после ответа «не знаю» срок обнуляется
-    (этап 0), поэтому без такого порядка очередь зацикливалась на одном слове.
+    ``/word`` и кнопка «🎲 Слово» показывают разные слова: всё, чьи карточки уже
+    уходили сегодня, исключается (см.
+    :func:`services.word_selector.on_demand_exclusions`). Ответ «не знаю»
+    возвращает слово на этап 0, то есть в расписание, а не в чат: иначе каждое
+    нажатие кнопки присылало то же слово, которое только что ответили, и очередь
+    ходила по кругу одних и тех же слов. Когда показывать больше нечего, отправки
+    нет, а причину объясняет хендлер (:func:`handlers.common.no_word_text`).
+
+    Проход идёт под замком пользователя (:func:`user_send_lock`): два быстрых
+    нажатия подряд обрабатываются одновременно, и без замка оба успевали выбрать
+    одно и то же слово, пока в журнал ``delivery_log`` не попала строка о первом.
+
+    :return: получилось ли отправить карточку.
     """
-    skip = await on_demand_exclusions(session, user)
-    if await deliver_main_word(bot, session, user, exclude_word_ids=skip):
-        return True
-    if await deliver_refresh_word(bot, session, user, exclude_word_ids=skip):
-        return True
-    if not skip:
-        return False
-
-    logger.info(
-        "Пользователь {}: других слов нет — повторяю слово из очереди",
-        user.telegram_id,
-    )
-    if await deliver_main_word(bot, session, user):
-        return True
-    return await deliver_refresh_word(bot, session, user)
+    async with user_send_lock(user.id):
+        skip = await on_demand_exclusions(session, user)
+        if await deliver_main_word(bot, session, user, exclude_word_ids=skip):
+            return True
+        return await deliver_refresh_word(bot, session, user, exclude_word_ids=skip)
