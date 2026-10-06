@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+# Локальные доступы к серверу (пароль SSH): в репозиторий не попадают.
+.deploy.env
 *.db
 *.db-wal
 *.db-shm
