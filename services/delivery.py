@@ -31,6 +31,7 @@ from services import translator
 from services.message_builder import build_refresh_card, build_word_card
 from services.word_selector import (
     SelectedWord,
+    new_words_allowed,
     on_demand_exclusions,
     select_main_word,
     select_refresh_word,
@@ -219,6 +220,19 @@ async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool
     ходила по кругу одних и тех же слов. Когда показывать больше нечего, отправки
     нет, а причину объясняет хендлер (:func:`handlers.common.no_word_text`).
 
+    Особый случай — достигнутый лимит слов в изучении: новые слова не приходят, но
+    повторения уже начатых остаются, и расписание их как раз и присылает. Кнопка
+    ведёт себя так же и повторяет, в том числе, слово, чья карточка сегодня уже
+    уходила и ответ на неё получен: иначе ручной запрос отказывал бы, пока те же
+    слова идут по слотам. Висящую же карточку без ответа очередь не повторяет и в
+    этом случае — её отсекает сам выбор слова
+    (:func:`services.word_selector.select_main_word`), поэтому у повторений
+    исключений не остаётся. Освежение — отдельная очередь, и к ней исключения
+    применяются как обычно: карточка освежения уходит раз в сутки, а её срок
+    повторения после отправки не сдвигается
+    (``db.repository.mark_user_word_for_refresh``), поэтому без исключений каждое
+    нажатие присылало бы ту же самую карточку.
+
     Проход идёт под замком пользователя (:func:`user_send_lock`): два быстрых
     нажатия подряд обрабатываются одновременно, и без замка оба успевали выбрать
     одно и то же слово, пока в журнал ``delivery_log`` не попала строка о первом.
@@ -227,6 +241,15 @@ async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool
     """
     async with user_send_lock(user.id):
         skip = await on_demand_exclusions(session, user)
-        if await deliver_main_word(bot, session, user, exclude_word_ids=skip):
+        # Лимит в изучении снимает исключения только для повторений: новых слов нет,
+        # но слова, чьи карточки сегодня уже уходили, кнопка повторяет так же, как
+        # это делает расписание. Висящую карточку и в этом случае отсекает сам выбор
+        # слова (services.word_selector.select_main_word), так что дублей нет.
+        repeat_skip: Collection[int] = skip
+        if not await new_words_allowed(session, user):
+            repeat_skip = ()
+        if await deliver_main_word(bot, session, user, exclude_word_ids=repeat_skip):
             return True
+        # Освежение — «бонусная» очередь, её исключения (сегодняшние показы) остаются
+        # в силе: см. docstring.
         return await deliver_refresh_word(bot, session, user, exclude_word_ids=skip)

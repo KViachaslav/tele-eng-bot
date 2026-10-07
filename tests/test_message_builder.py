@@ -194,14 +194,14 @@ def test_russian_line_follows_its_own_field_switch() -> None:
     assert escape_text("Она съела яблоко.") in card
 
 
-def test_audio_caption_adds_spoiled_russian_definition() -> None:
-    """В подписи к озвучке русское определение идёт второй строкой под спойлером."""
+def test_audio_caption_adds_spoiled_russian_translation() -> None:
+    """В подписи к озвучке русский перевод идёт второй строкой под спойлером."""
     caption = build_audio_caption(
-        "apple", config.AUDIO_ACCENT_UK, russian_definition="круглый плод"
+        "apple", config.AUDIO_ACCENT_UK, russian_translation="яблоко"
     )
 
     head = escape_text(texts.render_audio_caption("apple", config.AUDIO_ACCENT_UK))
-    assert caption == f"{head}\n{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}"
+    assert caption == f"{head}\n{texts.LABEL_RU} {spoiler(escape_text('яблоко'))}"
 
 
 def test_audio_caption_without_translation_stays_short() -> None:

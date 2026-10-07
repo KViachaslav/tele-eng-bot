@@ -99,7 +99,7 @@ def parse_learning_limit(raw: str | None) -> int | None:
 
 
 async def no_word_text(session: AsyncSession, user: User, now: datetime | None = None) -> str:
-    """Почему слово не пришло: пустой словарь, лимит в изучении, пустая очередь.
+    """Почему слово не пришло: пустой словарь, пустая очередь, лимит в изучении.
 
     Отдельный случай — «всё уже приходило сегодня»: подходящие слова есть, но их
     карточки уже уходили пользователю с начала его суток (ручной запрос ``/word``
@@ -107,9 +107,17 @@ async def no_word_text(session: AsyncSession, user: User, now: datetime | None =
     :func:`services.word_selector.on_demand_exclusions`). Тогда честнее сказать об
     этом прямо, чем отправлять «не нашёл подходящего слова» — которое намекает на
     фильтр по части речи или на пустой словарь.
+
+    Лимит слов в изучении проверяется последним: при достигнутом лимите ``/word``
+    не отказывает, а повторяет сегодняшние карточки
+    (:func:`services.delivery.deliver_on_demand`), поэтому настоящая причина
+    пустой очереди — именно сегодняшние показы, а не лимит.
     """
     if await repository.count_words(session) == 0:
         return texts.NO_WORDS_IN_DATABASE
+
+    if await word_selector.has_candidate_word(session, user, now or utcnow()):
+        return texts.WORD_SHOWN_TODAY
 
     if user.learning_limit_enabled:
         learning = await repository.count_learning_user_words(session, user)
@@ -119,9 +127,6 @@ async def no_word_text(session: AsyncSession, user: User, now: datetime | None =
                 limit=user.learning_limit,
                 stats=texts.CMD_STATS,
             )
-
-    if await word_selector.has_candidate_word(session, user, now or utcnow()):
-        return texts.WORD_SHOWN_TODAY
 
     return texts.WORD_NOT_FOUND
 

@@ -39,7 +39,7 @@ from handlers import word_actions
 from keyboards import inline as keyboards
 from keyboards.callbacks import AnswerCallback, AudioCallback, SettingsCallback, ShowCallback
 from services import audio, delivery, translator
-from services.message_builder import escape_text, spoiler
+from services.message_builder import build_audio_caption, escape_text, spoiler
 
 
 class FakeBot:
@@ -612,7 +612,11 @@ async def test_mismatched_word_writes_reason_to_log(session, user, words) -> Non
 # Озвучка: кнопки «🔊 🇬🇧 UK» и «🔊 🇺🇸 US»
 # ---------------------------------------------------------------------------
 async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> None:
-    """Кнопка озвучки присылает слово отдельным голосовым сообщением."""
+    """Кнопка озвучки присылает слово отдельным голосовым сообщением.
+
+    В подписи — слово, акцент и русский перевод под спойлером: послушав слово,
+    можно проверить, помнишь ли ты его смысл.
+    """
     sent = await repository.create_delivery(session, user.id, words[0].id)
     data = AudioCallback(
         word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
@@ -628,7 +632,11 @@ async def test_on_audio_sends_pronunciation(session, user, words, audio_dir) -> 
     message = bot.voices[0]
     assert message["chat_id"] == user.telegram_id
     assert Path(message["voice"].path) == file
-    assert message["caption"] == texts.render_audio_caption(words[0].word, config.AUDIO_ACCENT_UK)
+    assert message["caption"] == build_audio_caption(
+        words[0].word,
+        config.AUDIO_ACCENT_UK,
+        russian_translation=words[0].russian_translation,
+    )
     # Озвучка — не ответ: карточка не правится, статистика слова не меняется.
     assert bot.edits == []
     assert await repository.get_user_word(session, user.id, words[0].id) is None
@@ -693,8 +701,8 @@ async def test_on_audio_works_after_answer(session, user, words, audio_dir) -> N
 
     assert len(bot.voices) == 1
     assert Path(bot.voices[0]["voice"].path) == file
-    assert bot.voices[0]["caption"] == texts.render_audio_caption(
-        word.word, config.AUDIO_ACCENT_UK
+    assert bot.voices[0]["caption"] == build_audio_caption(
+        word.word, config.AUDIO_ACCENT_UK, russian_translation=word.russian_translation
     )
 
 
@@ -713,8 +721,10 @@ async def test_on_audio_sends_american_accent(session, user, words, audio_dir) -
     )
 
     assert Path(bot.voices[0]["voice"].path) == file
-    assert bot.voices[0]["caption"] == texts.render_audio_caption(
-        words[0].word, config.AUDIO_ACCENT_US
+    assert bot.voices[0]["caption"] == build_audio_caption(
+        words[0].word,
+        config.AUDIO_ACCENT_US,
+        russian_translation=words[0].russian_translation,
     )
 
 
@@ -771,13 +781,10 @@ async def test_on_show_adds_spoiled_russian_lines(
     assert request.queries == asked
 
 
-async def test_on_audio_caption_hides_russian_definition(
-    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+async def test_on_audio_caption_adds_russian_translation(
+    session, user, words, audio_dir
 ) -> None:
-    """В подписи к озвучке русское определение идёт второй строкой под спойлером."""
-    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
-    request = StubTranslation("круглый плод")
-    monkeypatch.setattr(translator, "request_translation", request)
+    """В подписи к озвучке русский перевод слова идёт второй строкой под спойлером."""
     sent = await repository.create_delivery(session, user.id, words[0].id)
     data = AudioCallback(
         word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
@@ -791,19 +798,18 @@ async def test_on_audio_caption_hides_russian_definition(
 
     caption = bot.voices[0]["caption"]
     assert caption.startswith(texts.render_audio_caption(words[0].word, config.AUDIO_ACCENT_UK))
-    assert caption.endswith(f"{texts.LABEL_RU} {spoiler(escape_text('круглый плод'))}")
-    saved = await repository.get_word_by_id(session, words[0].id)
-    assert saved is not None
-    assert saved.russian_definition == "круглый плод"
+    assert caption.endswith(f"{texts.LABEL_RU} {spoiler(escape_text('яблоко'))}")
 
 
-async def test_on_audio_caption_skips_hidden_definition(
-    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+async def test_on_audio_caption_keeps_translation_with_hidden_definition(
+    session, user, words, audio_dir
 ) -> None:
-    """Кто скрыл определение в карточке, не видит его и в подписи к озвучке."""
-    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
-    request = StubTranslation("круглый плод")
-    monkeypatch.setattr(translator, "request_translation", request)
+    """Скрытое определение не убирает перевод из подписи к озвучке.
+
+    Настройки карточки касаются полей «определение» и «пример»; русский перевод
+    слова в шапке карточки показывается всегда — и в подписи к озвучке он от них
+    не зависит.
+    """
     user_settings = await repository.get_or_create_user_settings(session, user)
     await repository.update_user_settings(session, user_settings, show_definition=False)
     sent = await repository.create_delivery(session, user.id, words[0].id)
@@ -817,21 +823,19 @@ async def test_on_audio_caption_skips_hidden_definition(
         callback=make_callback(data.pack(), bot), callback_data=data, session=session
     )
 
-    assert bot.voices[0]["caption"] == texts.render_audio_caption(
-        words[0].word, config.AUDIO_ACCENT_UK
+    assert bot.voices[0]["caption"].endswith(
+        f"{texts.LABEL_RU} {spoiler(escape_text('яблоко'))}"
     )
 
 
-async def test_on_audio_caption_stays_english_without_translation(
-    session, user, words, audio_dir, monkeypatch: pytest.MonkeyPatch
+async def test_on_audio_caption_without_translation_stays_short(
+    session, user, words, audio_dir
 ) -> None:
-    """Сервис перевода недоступен: подпись к озвучке выходит как раньше."""
-    monkeypatch.setattr(config.get_settings(), "translation_enabled", True)
-
-    async def failing_request(text: str, timeout: float | None = None) -> None:
-        return None
-
-    monkeypatch.setattr(translator, "request_translation", failing_request)
+    """У слова нет русского перевода: подпись к озвучке — только слово и акцент."""
+    saved = await repository.get_word_by_id(session, words[0].id)
+    assert saved is not None
+    saved.russian_translation = None
+    await session.commit()
     sent = await repository.create_delivery(session, user.id, words[0].id)
     data = AudioCallback(
         word_id=words[0].id, delivery_id=sent.id, accent=config.AUDIO_ACCENT_UK
@@ -1194,6 +1198,48 @@ async def test_on_demand_does_not_repeat_shown_word(session, user, words) -> Non
     assert sent_texts(bot) == [texts.WORD_SHOWN_TODAY]
 
 
+async def test_on_demand_at_learning_limit_skips_today_refresh(session, user, words) -> None:
+    """Лимит в изучении снимает исключения для повторений, но не для освежения.
+
+    Карточка освежения уходит раз в сутки: её срок повторения после отправки не
+    сдвигается (``db.repository.mark_user_word_for_refresh`` выставляет только
+    ``is_refresh``), поэтому без фильтра по сегодняшним показам каждое нажатие
+    «🎲 Слово» присылало бы ту же самую карточку. Повторять при лимите тоже нечего:
+    единственное изучаемое слово висит в чате без ответа.
+    """
+    await repository.update_user(session, user, learning_limit=1)
+    learned = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        learned,
+        stage=config.SRS_MAX_STAGE,
+        status=config.STATUS_LEARNED,
+        next_review_at=datetime(2020, 1, 1, 0, 0, 0),
+        last_reviewed_at=datetime(2019, 10, 1, 0, 0, 0),
+        times_correct=6,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    waiting = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        waiting,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=datetime(2020, 1, 1, 0, 0, 0),
+        last_reviewed_at=datetime(2019, 12, 31, 0, 0, 0),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    await repository.create_delivery(session, user.id, words[0].id)
+    await repository.create_delivery(session, user.id, words[1].id)
+    bot = FakeBot()
+
+    assert await delivery.deliver_on_demand(bot, session, user) is False
+    assert bot.sent == []
+
+
 async def test_two_presses_at_once_get_different_words(session, user, words) -> None:
     """Два одновременных запроса слова не повторяют одно и то же слово.
 
@@ -1407,6 +1453,77 @@ async def test_cmd_word_reports_learning_limit(session, user, words) -> None:
     assert sent_texts(bot) == [
         texts.NEW_WORDS_LIMIT_REACHED.format(learning=1, limit=1, stats=texts.CMD_STATS)
     ]
+
+
+async def test_cmd_word_repeats_today_word_at_learning_limit(session, user, words) -> None:
+    """При достигнутом лимите ``/word`` повторяет слово, чья карточка была сегодня.
+
+    Лимит изучения останавливает только новые слова: повторения уже начатых
+    приходят и дальше — их присылает расписание. Кнопка же исключала всё, что
+    показывали сегодня, и отвечала сообщением про лимит, пока те же слова шли по
+    слотам.
+    """
+    await repository.update_user(session, user, learning_limit=1)
+    revision = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        revision,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=datetime(2020, 1, 1, 0, 0, 0),
+        last_reviewed_at=datetime(2019, 12, 31, 0, 0, 0),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    shown = await repository.create_delivery(session, user.id, words[0].id)
+    await repository.mark_delivery_answered(
+        session, shown, config.ANSWER_DONT_KNOW, answered_at=datetime(2020, 1, 1, 0, 0, 0)
+    )
+    bot = FakeBot()
+
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=StubScheduler(),
+    )
+
+    assert word_ids_from(bot) == [words[0].id]
+    assert sent_texts(bot) == []
+
+
+async def test_cmd_word_at_learning_limit_reports_shown_today(session, user, words) -> None:
+    """Лимит достигнут, но повторять нечего: сообщение о показах, а не о лимите.
+
+    Карточка единственного начатого слова висит в чате без ответа — очередь её не
+    повторяет (см. :func:`services.word_selector.select_main_word`), поэтому
+    причина пустого ``/word`` — сегодняшний показ, а не лимит изучения.
+    """
+    await repository.update_user(session, user, learning_limit=1)
+    revision = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        revision,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=datetime(2020, 1, 1, 0, 0, 0),
+        last_reviewed_at=datetime(2019, 12, 31, 0, 0, 0),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+    await repository.create_delivery(session, user.id, words[0].id)
+    bot = FakeBot()
+
+    await word_actions.cmd_word(
+        message=make_message(texts.CMD_WORD, bot),
+        session=session,
+        bot=bot,
+        scheduler=StubScheduler(),
+    )
+
+    assert sent_texts(bot) == [texts.WORD_SHOWN_TODAY]
 
 
 async def test_cmd_word_without_dictionary(session, user) -> None:

@@ -25,8 +25,8 @@
 волной, которое можно послушать сразу, не открывая вложение. Telegram сам
 конвертирует mp3 из архива в формат голосовых (OGG/OPUS), поэтому ни ffmpeg, ни
 второй копии файлов на диске не нужно; акцент указан в подписи. Если у слова уже
-есть русский перевод определения, он добавляется в подпись второй строкой под
-спойлером (``services/message_builder.build_audio_caption``).
+есть русский перевод, он добавляется в подпись второй строкой под спойлером
+(``services/message_builder.build_audio_caption``).
 """
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ async def send_word_audio(
     path: Path,
     accent: str,
     *,
-    russian_definition: str | None = None,
+    russian_translation: str | None = None,
 ) -> bool:
     """Отправляет озвучку голосовым сообщением в тот же чат, где нажали кнопку.
 
@@ -158,12 +158,13 @@ async def send_word_audio(
     нет полей ``title``/``performer``, зато оно играет прямо в чате. Telegram сам
     конвертирует mp3 в OGG/OPUS. Подпись сообщает акцент, потому что в самом
     сообщении больше нечего показать кроме волны; если у слова есть русский
-    перевод определения, он идёт второй строкой под спойлером (см.
+    перевод, он идёт второй строкой под спойлером (см.
     :func:`services.message_builder.build_audio_caption`) — послушав слово, можно
     подсмотреть смысл, когда он нужен.
 
-    :param russian_definition: русский перевод определения слова (или ``None``) —
-        передаётся, только если определение вообще показывается пользователю.
+    :param russian_translation: русский перевод слова (или ``None``) — берётся из
+        словарной статьи и не зависит от настроек карточки: перевод показывается
+        всегда, в отличие от поля «определение».
     :return: ``False``, если сообщение недоступно или Telegram отклонил файл —
         тогда вызывающий код отвечает пользователю алертом.
     """
@@ -173,7 +174,7 @@ async def send_word_audio(
     try:
         await message.answer_voice(
             FSInputFile(path),
-            caption=build_audio_caption(word, accent, russian_definition=russian_definition),
+            caption=build_audio_caption(word, accent, russian_translation=russian_translation),
             parse_mode=config.PARSE_MODE,
         )
     except TelegramAPIError:

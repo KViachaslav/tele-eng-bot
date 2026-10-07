@@ -125,8 +125,10 @@ def _next_step(state: srs.SrsState) -> str:
 async def cmd_word(message: Message, session: AsyncSession, bot: Bot, scheduler: SchedulerService) -> None:
     """Присылает слово вне расписания.
 
-    Если слов нет, словарь пуст или достигнут лимит слов в изучении —
-    :func:`handlers.common.no_word_text` подсказывает причину. Отданное слово
+    Слово приходит и при достигнутом лимите слов в изучении: лимит закрывает
+    только новые слова, а повторения уже начатых очередь продолжает отдавать и по
+    кнопке (см. :func:`services.delivery.deliver_on_demand`). Если показать нечего,
+    причину подсказывает :func:`handlers.common.no_word_text`. Отданное слово
     расходует дневной план, поэтому после отправки расписание пересчитывается.
     """
     user = await common.load_user(session, message)
@@ -182,9 +184,9 @@ async def on_audio(
     Акцент приходит в ``callback_data`` кнопки, файл ищется в ``data/<акцент>``
     (см. :mod:`services.audio`): озвучен не весь словарь, поэтому для слова без
     файла приходит алерт, а сообщение с карточкой не меняется — ответ на слово
-    по-прежнему можно дать. В подпись к голосовому сообщению добавляется русское
-    определение слова под спойлером — послушав слово, можно проверить, помнишь ли
-    ты его смысл.
+    по-прежнему можно дать. В подпись к голосовому сообщению добавляется русский
+    перевод слова под спойлером — послушав слово, можно проверить, помнишь ли ты
+    его смысл.
     """
     user = await common.load_user_from_callback(session, callback)
     if user is None:
@@ -205,13 +207,14 @@ async def on_audio(
         await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
         return
 
-    # В подписи к голосовому сообщению русское определение появляется только у
-    # тех, кто вообще видит определение в карточке (поля настраиваются в /settings).
-    settings = await repository.get_or_create_user_settings(session, user)
-    await translator.ensure_word_translations(session, word)
-    definition_ru = word.russian_definition if settings.show_definition else None
+    # В подписи русский перевод слова — тот же, что и в шапке карточки. Настройки
+    # карточки его не касаются: поля «определение» можно скрыть, а перевод нет.
     if not await audio.send_word_audio(
-        callback.message, word.word, path, accent, russian_definition=definition_ru
+        callback.message,
+        word.word,
+        path,
+        accent,
+        russian_translation=word.russian_translation,
     ):
         await callback.answer(texts.render_audio_not_found(accent), show_alert=True)
         return
