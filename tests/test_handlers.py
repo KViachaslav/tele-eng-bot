@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,12 +33,13 @@ from loguru import logger
 import config
 import locales.ru as texts
 from db import repository
+from db.models import utcnow
 from handlers import settings as settings_handlers
 from handlers import start as start_handlers
 from handlers import word_actions
 from keyboards import inline as keyboards
 from keyboards.callbacks import AnswerCallback, AudioCallback, SettingsCallback, ShowCallback
-from services import audio, delivery, translator
+from services import audio, delivery, slots, translator
 from services.message_builder import build_audio_caption, escape_text, spoiler
 
 
@@ -138,6 +139,7 @@ async def matched_handlers(router: Router, callback: CallbackQuery) -> set[str]:
         (config.ACTION_LEARNING_LIMIT, "100", {"on_learning_limit_selected"}),
         (config.ACTION_FIELDS, "", {"on_fields"}),
         (config.ACTION_POS, "", {"on_pos"}),
+        (config.ACTION_FORECAST, "", {"on_forecast"}),
         (config.ACTION_CLOSE, "", {"on_close"}),
         (config.ACTION_BACK, "", {"on_back"}),
     ],
@@ -1159,14 +1161,42 @@ async def test_on_demand_skips_word_from_chat(session, user, words) -> None:
     assert word_ids_from(bot)[1] != waiting_id
 
 
-async def test_on_demand_does_not_repeat_shown_word(session, user, words) -> None:
-    """Слово, которое уже приходило сегодня, ручной запрос не повторяет.
+async def test_on_demand_delivers_review_due_later_today(session, user, words) -> None:
+    """Кнопка «🎲 Слово» отдаёт повторение, срок которого наступает позже сегодня.
 
-    Регрессия: ответ «не знаю» возвращает слово на этап 0 (срок повторения уже
-    наступил), поэтому кнопка «🎲 Слово» присылала то же самое слово снова и
-    снова. Фильтр по части речи оставляет пользователю одно слово, и других
-    вариантов в очереди нет — тогда отправки не будет, а хендлер объяснит причину
-    вместо повтора карточки.
+    План дня считает слова до конца местных суток пользователя, поэтому день можно
+    пройти досрочно. Раньше ручной запрос смотрел на «сейчас»: слово с вечерним
+    сроком ждало расписания, хотя в плане дня уже стояло.
+    """
+    await repository.update_user(session, user, words_per_day=1)
+    day_end = slots.local_day_end_utc(user, utcnow())
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=day_end - timedelta(minutes=1),
+        last_reviewed_at=utcnow() - timedelta(hours=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    bot = FakeBot()
+
+    assert await delivery.deliver_on_demand(bot, session, user) is True
+    assert word_ids_from(bot) == [words[0].id]
+
+
+async def test_on_demand_repeats_today_word_then_stops(session, user, words) -> None:
+    """Слово дня можно пройти заново, но не бесконечно.
+
+    Фильтр по части речи оставляет одно слово: новых слов нет, поэтому кнопка
+    отдаёт слова плана дня, а когда план выполнен — повторяет то, что уже приходило.
+    Ответ «не знаю» возвращает слово на этап 0 (то есть обратно в план дня), поэтому
+    второй раз оно приходит как слово плана, а после лимита показов за сутки
+    (``config.ON_DEMAND_MAX_SENDS_PER_DAY``) кнопка замолкает и сообщает о
+    выполненном плане — вместо того чтобы крутить одно и то же слово.
     """
     await repository.set_pos_filter(session, user, {config.POS_NOUN})
     bot = FakeBot()
@@ -1185,8 +1215,12 @@ async def test_on_demand_does_not_repeat_shown_word(session, user, words) -> Non
         scheduler=StubScheduler(),
     )
 
+    # «Не знаю» вернуло слово на этап 0 — оно снова в плане дня.
+    assert await delivery.deliver_on_demand(bot, session, user) is True
+    assert word_ids_from(bot) == [show_data.word_id, show_data.word_id]
+
+    # Показов за сутки уже два — слово ручной запрос больше не присылает.
     assert await delivery.deliver_on_demand(bot, session, user) is False
-    assert word_ids_from(bot) == [show_data.word_id]
 
     await word_actions.cmd_word(
         message=make_message(texts.CMD_WORD, bot),
@@ -1195,17 +1229,18 @@ async def test_on_demand_does_not_repeat_shown_word(session, user, words) -> Non
         scheduler=StubScheduler(),
     )
 
-    assert sent_texts(bot) == [texts.WORD_SHOWN_TODAY]
+    assert sent_texts(bot) == [texts.WORD_PLAN_DONE_TODAY]
 
 
 async def test_on_demand_at_learning_limit_skips_today_refresh(session, user, words) -> None:
-    """Лимит в изучении снимает исключения для повторений, но не для освежения.
+    """Освежение ручной запрос не выдаёт: его в плане дня нет.
 
-    Карточка освежения уходит раз в сутки: её срок повторения после отправки не
-    сдвигается (``db.repository.mark_user_word_for_refresh`` выставляет только
-    ``is_refresh``), поэтому без фильтра по сегодняшним показам каждое нажатие
-    «🎲 Слово» присылало бы ту же самую карточку. Повторять при лимите тоже нечего:
-    единственное изучаемое слово висит в чате без ответа.
+    Освежение приходит отдельным сообщением от расписания, а его карточка после
+    отправки срок повторения не сдвигает
+    (``db.repository.mark_user_word_for_refresh`` выставляет только ``is_refresh``),
+    поэтому кнопка «🎲 Слово» его не повторяет. Здесь повторить и нечего:
+    единственное изучаемое слово висит в чате без ответа, а нового слова нет из-за
+    лимита слов в изучении.
     """
     await repository.update_user(session, user, learning_limit=1)
     learned = await repository.get_or_create_user_word(session, user.id, words[0].id)
@@ -1494,11 +1529,12 @@ async def test_cmd_word_repeats_today_word_at_learning_limit(session, user, word
 
 
 async def test_cmd_word_at_learning_limit_reports_shown_today(session, user, words) -> None:
-    """Лимит достигнут, но повторять нечего: сообщение о показах, а не о лимите.
+    """Лимит достигнут, но повторять нечего: сообщение о плане дня, а не о лимите.
 
-    Карточка единственного начатого слова висит в чате без ответа — очередь её не
-    повторяет (см. :func:`services.word_selector.select_main_word`), поэтому
-    причина пустого ``/word`` — сегодняшний показ, а не лимит изучения.
+    Карточка единственного начатого слова висит в чате без ответа — ручной запрос
+    её не повторяет (см. :func:`services.word_selector.on_demand_exclusions`), а
+    сегодня уже был показ. Поэтому причина пустого ``/word`` — выполненный план дня,
+    а не лимит изучения (см. :func:`handlers.common.no_word_text`).
     """
     await repository.update_user(session, user, learning_limit=1)
     revision = await repository.get_or_create_user_word(session, user.id, words[0].id)
@@ -1523,7 +1559,7 @@ async def test_cmd_word_at_learning_limit_reports_shown_today(session, user, wor
         scheduler=StubScheduler(),
     )
 
-    assert sent_texts(bot) == [texts.WORD_SHOWN_TODAY]
+    assert sent_texts(bot) == [texts.WORD_PLAN_DONE_TODAY]
 
 
 async def test_cmd_word_without_dictionary(session, user) -> None:
@@ -1593,3 +1629,64 @@ async def test_cmd_word_without_words_keeps_schedule(session, user) -> None:
     )
 
     assert scheduler.rescheduled == []
+
+
+# ---------------------------------------------------------------------------
+# План слов: сколько слов придёт сегодня и в ближайшие дни
+# ---------------------------------------------------------------------------
+async def test_settings_menu_has_forecast_button(session, user) -> None:
+    """В меню настроек есть кнопка «📅 План слов»."""
+    settings = await repository.get_or_create_user_settings(session, user)
+
+    markup = keyboards.settings_menu_keyboard(user, settings)
+    callbacks = {
+        button.callback_data: button.text
+        for row in markup.inline_keyboard
+        for button in row
+    }
+
+    assert (
+        callbacks[SettingsCallback(action=config.ACTION_FORECAST, value="").pack()]
+        == texts.BTN_SETTINGS_FORECAST
+    )
+
+
+async def test_on_forecast_shows_plan_for_upcoming_days(
+    session, user, words, now, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Экран «📅 План слов» показывает, сколько слов придёт сегодня и дальше.
+
+    Словарь маленький — три неизученных слова при норме «два в день», поэтому
+    прогноз такой: два слова сегодня, одно завтра и пусто на третий день.
+    Повторений нет: ни один срок ещё не наступил.
+    """
+    await repository.update_user(session, user, words_per_day=2)
+    monkeypatch.setattr(settings_handlers, "utcnow", lambda: now)
+    bot = FakeBot()
+
+    await settings_handlers.on_forecast(
+        callback=make_callback(
+            SettingsCallback(action=config.ACTION_FORECAST, value="").pack(), bot
+        ),
+        session=session,
+    )
+
+    upcoming = "\n".join(
+        texts.FORECAST_DAY_LINE.format(
+            date=day, words=texts.render_words(total), new=total, reviews=0
+        )
+        for day, total in (("16.01", 1), ("17.01", 0))
+    )
+    expected = texts.FORECAST_MENU.format(
+        date="15.01",
+        words=texts.render_words(2),
+        new=2,
+        reviews=0,
+        upcoming=upcoming,
+    ) + texts.FORECAST_HINT
+
+    assert bot.edits[-1]["text"] == expected
+    assert [
+        button.text for row in bot.edits[-1]["reply_markup"].inline_keyboard for button in row
+    ] == [texts.BTN_BACK]
+    assert len(alerts_from(bot)) == 1

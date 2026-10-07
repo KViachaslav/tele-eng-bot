@@ -10,6 +10,11 @@
 Отправки одного пользователя сериализуются, а строка журнала ``delivery_log``
 фиксируется до отправки: иначе слот планировщика и нажатие «🎲 Слово» в одну
 секунду выбирали одно и то же слово (см. :func:`user_send_lock`).
+
+Ручной запрос «дай слово» идёт по плану дня в два прохода
+(:func:`deliver_on_demand`): сначала слова, которые ещё предстоит отдать сегодня
+(срок повторения — до конца местных суток пользователя), затем слова дня, которые
+уже приходили и получили ответ, — чтобы день можно было пройти заново.
 """
 from __future__ import annotations
 
@@ -31,10 +36,11 @@ from services import translator
 from services.message_builder import build_refresh_card, build_word_card
 from services.word_selector import (
     SelectedWord,
-    new_words_allowed,
     on_demand_exclusions,
     select_main_word,
+    select_plan_word,
     select_refresh_word,
+    select_repeat_word,
 )
 
 
@@ -171,6 +177,53 @@ async def deliver_main_word(
     return await _deliver(bot, session, user, selected)
 
 
+async def deliver_plan_word(
+    bot: Bot,
+    session: AsyncSession,
+    user: User,
+    *,
+    exclude_word_ids: Collection[int] = (),
+) -> bool:
+    """Отправляет слово из плана дня: повторение со сроком до конца суток или новое.
+
+    Этим проходом пользуется ручной запрос «дай слово»: он идёт по плану дня, а не
+    по срочности «пора показать сейчас», поэтому сегодняшние повторения можно
+    пройти досрочно (см. :func:`services.word_selector.select_plan_word`).
+
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`services.word_selector.on_demand_exclusions`).
+    """
+    selected = await select_plan_word(
+        session, user, utcnow(), exclude_word_ids=exclude_word_ids
+    )
+    if selected is None:
+        return False
+    return await _deliver(bot, session, user, selected)
+
+
+async def deliver_repeat_word(
+    bot: Bot,
+    session: AsyncSession,
+    user: User,
+    *,
+    exclude_word_ids: Collection[int] = (),
+) -> bool:
+    """Отправляет слово дня, которое уже приходило и отвечено (повторный проход).
+
+    Идёт после того, как план дня выполнен: так кнопкой «🎲 Слово» можно пройти день
+    заново (см. :func:`services.word_selector.select_repeat_word`).
+
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`services.word_selector.on_demand_exclusions`).
+    """
+    selected = await select_repeat_word(
+        session, user, utcnow(), exclude_word_ids=exclude_word_ids
+    )
+    if selected is None:
+        return False
+    return await _deliver(bot, session, user, selected)
+
+
 async def deliver_refresh_word(
     bot: Bot,
     session: AsyncSession,
@@ -210,28 +263,27 @@ async def deliver_slot(bot: Bot, session: AsyncSession, user: User) -> int:
 
 
 async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool:
-    """Отправка по команде ``/word``: слово, которого сегодня ещё не было в чате.
+    """Отправка по команде ``/word``: слова плана дня, затем повтор дня.
 
-    ``/word`` и кнопка «🎲 Слово» показывают разные слова: всё, чьи карточки уже
-    уходили сегодня, исключается (см.
-    :func:`services.word_selector.on_demand_exclusions`). Ответ «не знаю»
-    возвращает слово на этап 0, то есть в расписание, а не в чат: иначе каждое
-    нажатие кнопки присылало то же слово, которое только что ответили, и очередь
-    ходила по кругу одних и тех же слов. Когда показывать больше нечего, отправки
-    нет, а причину объясняет хендлер (:func:`handlers.common.no_word_text`).
+    Кнопка «🎲 Слово» идёт ровно по словам текущего дня — в два прохода:
 
-    Особый случай — достигнутый лимит слов в изучении: новые слова не приходят, но
-    повторения уже начатых остаются, и расписание их как раз и присылает. Кнопка
-    ведёт себя так же и повторяет, в том числе, слово, чья карточка сегодня уже
-    уходила и ответ на неё получен: иначе ручной запрос отказывал бы, пока те же
-    слова идут по слотам. Висящую же карточку без ответа очередь не повторяет и в
-    этом случае — её отсекает сам выбор слова
-    (:func:`services.word_selector.select_main_word`), поэтому у повторений
-    исключений не остаётся. Освежение — отдельная очередь, и к ней исключения
-    применяются как обычно: карточка освежения уходит раз в сутки, а её срок
-    повторения после отправки не сдвигается
-    (``db.repository.mark_user_word_for_refresh``), поэтому без исключений каждое
-    нажатие присылало бы ту же самую карточку.
+    1. **План дня** (:func:`deliver_plan_word`): повторения, срок которых наступает
+       не позже конца местных суток пользователя, и новые слова по общим правилам.
+       Границы суток те же, что у плана дня (:func:`services.plan.words_left_today`),
+       поэтому день можно пройти досрочно: отданное слово расходует пункт плана,
+       интервал до следующего слова растёт, а пройденное расписание больше не
+       присылает. Освежение (выученные слова) в этот проход не входит: его в плане
+       дня нет, и расписание присылает его отдельным сообщением.
+    2. **Повтор дня** (:func:`deliver_repeat_word`): слова, которые сегодня уже
+       приходили и получили ответ, — чтобы день можно было пройти заново, когда план
+       исчерпан.
+
+    Лишний раз то же слово не вернётся: висящая карточка и слова, исчерпавшие лимит
+    показов за сутки, исключены (:func:`services.word_selector.on_demand_exclusions`).
+    Так пара «нажатие → «не знаю»» не ходит по кругу: ответ возвращает слово на
+    этап 0 (то есть в план дня), но после ``config.ON_DEMAND_MAX_SENDS_PER_DAY``
+    показов за сутки очередь его пропускает — и ручной запрос честно сообщает, что
+    план дня выполнен (:func:`handlers.common.no_word_text`).
 
     Проход идёт под замком пользователя (:func:`user_send_lock`): два быстрых
     нажатия подряд обрабатываются одновременно, и без замка оба успевали выбрать
@@ -241,15 +293,6 @@ async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool
     """
     async with user_send_lock(user.id):
         skip = await on_demand_exclusions(session, user)
-        # Лимит в изучении снимает исключения только для повторений: новых слов нет,
-        # но слова, чьи карточки сегодня уже уходили, кнопка повторяет так же, как
-        # это делает расписание. Висящую карточку и в этом случае отсекает сам выбор
-        # слова (services.word_selector.select_main_word), так что дублей нет.
-        repeat_skip: Collection[int] = skip
-        if not await new_words_allowed(session, user):
-            repeat_skip = ()
-        if await deliver_main_word(bot, session, user, exclude_word_ids=repeat_skip):
+        if await deliver_plan_word(bot, session, user, exclude_word_ids=skip):
             return True
-        # Освежение — «бонусная» очередь, её исключения (сегодняшние показы) остаются
-        # в силе: см. docstring.
-        return await deliver_refresh_word(bot, session, user, exclude_word_ids=skip)
+        return await deliver_repeat_word(bot, session, user, exclude_word_ids=skip)

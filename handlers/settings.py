@@ -19,12 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 import locales.ru as texts
 from db import repository
-from db.models import User, UserSettings
+from db.models import User, UserSettings, utcnow
 from handlers import common
 from keyboards.callbacks import SettingsCallback
 from keyboards.inline import (
     decode_window_value,
     fields_keyboard,
+    forecast_keyboard,
     learning_limit_keyboard,
     mode_keyboard,
     pos_filter_keyboard,
@@ -34,7 +35,7 @@ from keyboards.inline import (
     window_keyboard,
     words_per_day_keyboard,
 )
-from services import slots
+from services import plan, slots
 from services.scheduler import SchedulerService
 
 router = Router(name="settings")
@@ -110,6 +111,27 @@ def _pos_text() -> str:
     return texts.POS_MENU.format(values=", ".join(texts.POS_TITLES.values()))
 
 
+def _forecast_text(user: User, days: list[plan.DayPlan]) -> str:
+    """Текст экрана «📅 План слов»: слова сегодня и в ближайшие дни."""
+    today = days[0]
+    upcoming = "\n".join(
+        texts.FORECAST_DAY_LINE.format(
+            date=day.local_day.strftime(config.DATE_FORMAT),
+            words=texts.render_words(day.total),
+            new=day.new_words,
+            reviews=day.reviews,
+        )
+        for day in days[1:]
+    )
+    return texts.FORECAST_MENU.format(
+        date=today.local_day.strftime(config.DATE_FORMAT),
+        words=texts.render_words(today.total),
+        new=today.new_words,
+        reviews=today.reviews,
+        upcoming=upcoming or config.EMPTY_VALUE_MARKER,
+    ) + texts.FORECAST_HINT
+
+
 def _notice(user: User, value: object, moment: datetime | None) -> str:
     """Подтверждение сохранения с подсказкой о ближайшем слове."""
     return texts.SETTING_SAVED.format(value=value) + common.next_word_suffix(user, moment)
@@ -177,6 +199,25 @@ async def on_back(callback: CallbackQuery, session: AsyncSession) -> None:
     if user is None:
         return
     await _edit_menu(callback, session, user)
+    await callback.answer()
+
+
+@router.callback_query(SettingsCallback.filter(F.action == config.ACTION_FORECAST))
+async def on_forecast(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Показывает, сколько слов придёт сегодня и в ближайшие дни.
+
+    Экран только читает настройки и расписание: он ничего не меняет, поэтому
+    кнопка стоит рядом с «🕘 Временное окно» — там же, где настраивается график.
+    Слова считает :func:`services.plan.upcoming_plan`: прогноз строится по
+    текущему плану дня и срокам повторений.
+    """
+    user = await common.load_user_from_callback(session, callback)
+    if user is None:
+        return
+    days = await plan.upcoming_plan(session, user, utcnow(), config.FORECAST_DAYS)
+    await common.safe_edit_text(
+        callback.message, _forecast_text(user, days), forecast_keyboard()
+    )
     await callback.answer()
 
 

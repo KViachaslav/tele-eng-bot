@@ -99,25 +99,25 @@ def parse_learning_limit(raw: str | None) -> int | None:
 
 
 async def no_word_text(session: AsyncSession, user: User, now: datetime | None = None) -> str:
-    """Почему слово не пришло: пустой словарь, пустая очередь, лимит в изучении.
+    """Почему слово не пришло: пустой словарь, план дня, лимит в изучении, фильтр.
 
-    Отдельный случай — «всё уже приходило сегодня»: подходящие слова есть, но их
-    карточки уже уходили пользователю с начала его суток (ручной запрос ``/word``
-    не повторяет показанное, см.
+    Отдельный случай — «план дня выполнен»: слова дня уже приходили, а каждое слово
+    отдаётся вручную не больше лимита показов за сутки
+    (``config.ON_DEMAND_MAX_SENDS_PER_DAY``, см.
     :func:`services.word_selector.on_demand_exclusions`). Тогда честнее сказать об
     этом прямо, чем отправлять «не нашёл подходящего слова» — которое намекает на
-    фильтр по части речи или на пустой словарь.
+    фильтр по части речи или на пустой словарь. Признак именно этого случая —
+    сегодняшние показы (:func:`services.word_selector.words_shown_today`).
 
-    Лимит слов в изучении проверяется последним: при достигнутом лимите ``/word``
-    не отказывает, а повторяет сегодняшние карточки
-    (:func:`services.delivery.deliver_on_demand`), поэтому настоящая причина
-    пустой очереди — именно сегодняшние показы, а не лимит.
+    Лимит слов в изучении проверяется последним: пока в плане дня были слова,
+    ручной запрос отдавал их (:func:`services.delivery.deliver_on_demand`), поэтому
+    настоящая причина пустой очереди — именно сегодняшние показы, а не лимит.
     """
     if await repository.count_words(session) == 0:
         return texts.NO_WORDS_IN_DATABASE
 
-    if await word_selector.has_candidate_word(session, user, now or utcnow()):
-        return texts.WORD_SHOWN_TODAY
+    if await word_selector.words_shown_today(session, user, now or utcnow()):
+        return texts.WORD_PLAN_DONE_TODAY
 
     if user.learning_limit_enabled:
         learning = await repository.count_learning_user_words(session, user)

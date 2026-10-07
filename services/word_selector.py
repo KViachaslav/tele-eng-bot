@@ -12,9 +12,16 @@
 не приходит (:func:`hanging_card_word_ids`) — лучше пропустить слот, чем слать одно
 и то же слово, пока не закроется окно рассылки.
 
-Ручной запрос «дай слово» третьей ступенью не пользуется: слова, которые уже
-уходили сегодня, ему отдаёт :func:`on_demand_exclusions` — иначе одно нажатие
-возвращало бы в чат только что отвеченное слово (см. :mod:`services.delivery`).
+Ручной запрос «дай слово» (``/word`` и кнопка «🎲 Слово») идёт **по плану дня**
+(:func:`select_plan_word`): срок повторения сравнивается не с «сейчас», а с концом
+сегодняшних суток пользователя — так же, как этот план считает
+:func:`services.plan.words_left_today`. Поэтому день можно пройти досрочно, а
+расписание после этого уже не пришлёт пройденные слова. Когда в плане ничего не
+осталось, очередь отдаёт слова, которые сегодня уже приходили и получили ответ
+(:func:`select_repeat_word`), — «пройти день заново». Лишний раз то же слово не
+вернётся: :func:`on_demand_exclusions` держит лимит показов за сутки
+(``config.ON_DEMAND_MAX_SENDS_PER_DAY``) и не повторяет висящую карточку
+(см. :mod:`services.delivery`).
 
 Новые слова выбираются **случайно** (а не по порядку загрузки словаря) и только
 пока слов «в изучении» меньше ``users.learning_limit`` и не израсходован дневной
@@ -30,6 +37,7 @@ from datetime import datetime
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import config
 from db import repository
 from db.models import User, UserWord, Word, utcnow
 from services import slots
@@ -78,26 +86,102 @@ async def new_words_left_today(session: AsyncSession, user: User, now: datetime)
     return started < user.words_per_day
 
 
+async def select_due_word(
+    session: AsyncSession,
+    user: User,
+    now: datetime,
+    *,
+    due_until: datetime,
+    exclude_word_ids: Collection[int] = (),
+) -> SelectedWord | None:
+    """Повторение, срок которого наступает не позже ``due_until`` и ждёт отправки.
+
+    «Ждёт отправки» означает, что карточки сегодня ещё не было или на неё уже
+    ответили (:func:`db.repository.waiting_for_repeat_condition`). Карточка,
+    которая висит в чате без ответа, второй раз не приходит: отправка прогресс не
+    двигает, порядок очереди не меняется, поэтому выбор каждый раз упирался бы в
+    самое просроченное слово — в базе 04.10.2026 «seat» приходило 11 раз подряд,
+    пока не закрылось окно рассылки.
+
+    :param due_until: граница «пора показать»: у рассылки по слотам это «сейчас», а
+        у запроса «дай слово» — конец местных суток пользователя, чтобы слова дня
+        можно было пройти досрочно (см. :func:`select_plan_word`).
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`on_demand_exclusions`).
+    """
+    due_words = await repository.fetch_due_user_words(
+        session,
+        user,
+        due_until,
+        1,
+        user.pos_filter_values,
+        exclude_word_ids=exclude_word_ids,
+        not_shown_since=slots.local_day_start_utc(user, now),
+    )
+    if not due_words:
+        return None
+    user_word = due_words[0]
+    return SelectedWord(word=user_word.word, user_word=user_word)
+
+
+async def select_new_word(
+    session: AsyncSession,
+    user: User,
+    now: datetime,
+    *,
+    exclude_word_ids: Collection[int] = (),
+) -> SelectedWord | None:
+    """Новое слово (случайное из словаря), если это разрешено настройками.
+
+    Новые слова показываются, только пока слов «в изучении» меньше
+    ``users.learning_limit`` (:func:`new_words_allowed`) и не израсходован дневной
+    план ``users.words_per_day`` (:func:`new_words_left_today`). Оба ограничения
+    общие для рассылки по слотам и для запроса «дай слово».
+
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`on_demand_exclusions`).
+    """
+    if not await new_words_allowed(session, user):
+        logger.debug(
+            "Пользователь {}: лимит слов в изучении ({}) достигнут — новых слов не показываю",
+            user.telegram_id,
+            user.learning_limit,
+        )
+        return None
+    if not await new_words_left_today(session, user, now):
+        logger.debug(
+            "Пользователь {}: дневной план новых слов ({}) выполнен — новых слов не показываю",
+            user.telegram_id,
+            user.words_per_day,
+        )
+        return None
+    fresh_words = await repository.fetch_new_words(
+        session, user, 1, user.pos_filter_values, exclude_word_ids=exclude_word_ids
+    )
+    if not fresh_words:
+        return None
+    return SelectedWord(word=fresh_words[0])
+
+
 async def select_main_word(
     session: AsyncSession,
     user: User,
     now: datetime,
     *,
     exclude_word_ids: Collection[int] = (),
-    allow_waiting_card: bool = False,
 ) -> SelectedWord | None:
-    """Слово для обычной рассылки.
+    """Слово для обычной рассылки (очередь слота).
 
     Приоритет:
 
-    1. повторения, которые **снова ждут отправки** (``not_shown_since``): слова с
-       наступившим сроком повторения, этапы 1–5, которых сегодня ещё не
-       показывали, а также те, на которые после сегодняшней карточки ответили;
-    2. новое слово (в случайном порядке) — пока не достигнут лимит
-       ``users.learning_limit`` и не израсходован дневной план
-       ``users.words_per_day`` (:func:`new_words_left_today`);
-    3. прочие повторения: слова, чьи карточки сегодня уже приходили и ответ на
-       них получен.
+    1. повторения, которые **снова ждут отправки**: слова с наступившим сроком
+       повторения, которых сегодня ещё не показывали, а также те, на которые после
+       сегодняшней карточки ответили — на «сейчас», как и у расписания
+       (:func:`select_due_word`);
+    2. новое слово — пока не достигнут лимит ``users.learning_limit`` и не
+       израсходован дневной план ``users.words_per_day`` (:func:`select_new_word`);
+    3. прочие повторения: слова, чьи карточки сегодня уже приходили и ответ на них
+       получен.
 
     Третий пункт нужен для «не знаю»: ответ сбрасывает слово на этап 0, и его срок
     повторения наступает сразу же. Без отделения таких слов от первых двух пунктов
@@ -106,76 +190,114 @@ async def select_main_word(
     вариантов не осталось (например, упёрлись в лимит изучения или кончился
     словарь).
 
-    Карточка без ответа не выбирается ни на одной ступени
-    (:func:`hanging_card_word_ids`): отправка прогресс не двигает, порядок очереди
-    не меняется, поэтому выбор каждый раз упирался бы в самое просроченное слово —
-    в базе 04.10.2026 «seat» приходило 11 раз подряд, пока не закрылось окно
-    рассылки. Пропущенный слот лучше повтора: план дня от такой отправки всё равно
-    не убывает.
+    Ручной запрос «дай слово» этой ступенью не пользуется: он идёт строго по плану
+    дня, а показанные слова повторяет отдельной очередью
+    (:func:`select_plan_word`, :func:`select_repeat_word`).
 
     Выученные слова здесь не участвуют — они приходят отдельной очередью освежения
     и не съедают дневной лимит.
 
     :param exclude_word_ids: слова, которые сейчас присылать не нужно
         (см. :func:`on_demand_exclusions`).
-    :param allow_waiting_card: разрешить повтор слова, чья карточка ушла сегодня и
-        осталась без ответа. Нужно только диагностике
-        (:func:`has_candidate_word`): она отвечает на вопрос «есть ли слово вообще,
-        если забыть про исключения».
     """
-    pos_values = user.pos_filter_values
-    day_start = slots.local_day_start_utc(user, now)
-
-    due_words = await repository.fetch_due_user_words(
-        session,
-        user,
-        now,
-        1,
-        pos_values,
-        exclude_word_ids=exclude_word_ids,
-        not_shown_since=day_start,
+    due = await select_due_word(
+        session, user, now, due_until=now, exclude_word_ids=exclude_word_ids
     )
-    if due_words:
-        user_word = due_words[0]
-        return SelectedWord(word=user_word.word, user_word=user_word)
+    if due is not None:
+        return due
 
-    if not await new_words_allowed(session, user):
-        logger.debug(
-            "Пользователь {}: лимит слов в изучении ({}) достигнут — новых слов не показываю",
-            user.telegram_id,
-            user.learning_limit,
-        )
-    elif not await new_words_left_today(session, user, now):
-        logger.debug(
-            "Пользователь {}: дневной план новых слов ({}) выполнен — новых слов не показываю",
-            user.telegram_id,
-            user.words_per_day,
-        )
-    else:
-        fresh_words = await repository.fetch_new_words(
-            session, user, 1, pos_values, exclude_word_ids=exclude_word_ids
-        )
-        if fresh_words:
-            return SelectedWord(word=fresh_words[0])
+    fresh = await select_new_word(session, user, now, exclude_word_ids=exclude_word_ids)
+    if fresh is not None:
+        return fresh
 
     # Всё, что осталось, — повторение слова, чья карточка сегодня уже уходила и
     # ответ на неё получен. Слова с висящей карточкой не выбираем (см. docstring).
     repeated_skip = set(exclude_word_ids)
-    if not allow_waiting_card:
-        repeated_skip |= await hanging_card_word_ids(session, user, now)
+    repeated_skip |= await hanging_card_word_ids(session, user, now)
     repeated_words = await repository.fetch_due_user_words(
-        session, user, now, 1, pos_values, exclude_word_ids=repeated_skip
+        session, user, now, 1, user.pos_filter_values, exclude_word_ids=repeated_skip
     )
-    if repeated_words:
-        user_word = repeated_words[0]
-        logger.debug(
-            "Пользователь {}: других слов нет — повторяю «{}»",
-            user.telegram_id,
-            user_word.word.word,
-        )
-        return SelectedWord(word=user_word.word, user_word=user_word)
+    if not repeated_words:
+        return None
+    user_word = repeated_words[0]
+    logger.debug(
+        "Пользователь {}: других слов нет — повторяю «{}»",
+        user.telegram_id,
+        user_word.word.word,
+    )
+    return SelectedWord(word=user_word.word, user_word=user_word)
 
-    return None
+
+async def select_plan_word(
+    session: AsyncSession,
+    user: User,
+    now: datetime,
+    *,
+    exclude_word_ids: Collection[int] = (),
+) -> SelectedWord | None:
+    """Слово из плана дня: повторение со сроком до конца суток либо новое слово.
+
+    Ручной запрос «дай слово» идёт по этому плану, а не по срочности «пора показать
+    сейчас»: граница показа — конец местных суток пользователя
+    (:func:`services.slots.local_day_end_utc`). Так же считает план дня
+    (:func:`services.plan.words_left_today`), поэтому одним нажатием можно пройти
+    сегодняшние повторения досрочно, а отданное слово расходует пункт плана точно
+    как слово по расписанию: после этого расписание уже не пришлёт его снова.
+
+    Новые слова добавляются по общим правилам (:func:`select_new_word`). Третьей
+    ступени очереди слота здесь нет: она отдаёт слова, чьи карточки сегодня уже
+    уходили, а ручной запрос делает это отдельным, повторным проходом
+    (:func:`select_repeat_word`).
+
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`on_demand_exclusions`).
+    """
+    day_end = slots.local_day_end_utc(user, now)
+    due = await select_due_word(
+        session, user, now, due_until=day_end, exclude_word_ids=exclude_word_ids
+    )
+    if due is not None:
+        return due
+    return await select_new_word(session, user, now, exclude_word_ids=exclude_word_ids)
+
+
+async def select_repeat_word(
+    session: AsyncSession,
+    user: User,
+    now: datetime,
+    *,
+    exclude_word_ids: Collection[int] = (),
+) -> SelectedWord | None:
+    """Слово дня, которое уже приходило и отвечено, — повторный проход по дню.
+
+    Ручной запрос отдаёт эти слова, когда план дня выполнен: так день можно пройти
+    заново, не дожидаясь завтрашних сроков повторения. Подходят слова, которые
+    сегодня приходили ровно один раз и получили ответ
+    (:func:`db.repository.fetch_repeat_user_words`); висящая карточка и слова,
+    исчерпавшие лимит показов за сутки, отсекаются
+    (:func:`on_demand_exclusions`).
+
+    :param exclude_word_ids: слова, которые сейчас присылать не нужно
+        (см. :func:`on_demand_exclusions`).
+    """
+    day_start = slots.local_day_start_utc(user, now)
+    repeats = await repository.fetch_repeat_user_words(
+        session,
+        user,
+        since=day_start,
+        limit=1,
+        pos_values=user.pos_filter_values,
+        exclude_word_ids=exclude_word_ids,
+    )
+    if not repeats:
+        return None
+    user_word = repeats[0]
+    logger.debug(
+        "Пользователь {}: план дня выполнен — повторяю слово дня «{}»",
+        user.telegram_id,
+        user_word.word.word,
+    )
+    return SelectedWord(word=user_word.word, user_word=user_word)
 
 
 async def select_refresh_word(
@@ -207,25 +329,36 @@ async def select_refresh_word(
 async def on_demand_exclusions(
     session: AsyncSession, user: User, now: datetime | None = None
 ) -> set[int]:
-    """Слова, которые не стоит присылать снова по ручному запросу «дай слово».
+    """Слова, которые ручной запрос «дай слово» сейчас присылать не должен.
 
     В набор попадают:
 
-    * все слова, карточки которых уходили **с сегодняшнего дня** — независимо от
-      того, ответил на них пользователь или нет. Ответ «не знаю» обнуляет срок
-      повторения (этап 0 — слово снова «на сегодня»), поэтому без этого правила
-      каждое нажатие «🎲 Слово» присылало то же слово, которое только что было в
-      чате. Карточка, отправленная вчера, уже не «висит» — иначе слово выпало бы
-      из очереди ``/word`` навсегда, как только пользователь забудет на неё
-      ответить (см. :func:`services.slots.local_day_start_utc`);
-    * слово из самой последней отправки — на случай, когда она была вчера.
+    * слова, чьи карточки висят в чате без ответа с начала местных суток
+      (:func:`hanging_card_word_ids`): повтор прогресс не двигает, а в чате
+      оказались бы две одинаковые карточки;
+    * слова, карточки которых уходили сегодня уже
+      ``config.ON_DEMAND_MAX_SENDS_PER_DAY`` раз
+      (:func:`db.repository.fetch_word_ids_sent_at_least`). Каждое слово дня можно
+      пройти заново, но не бесконечно: ответ «не знаю» возвращает слово на этап 0
+      (срок повторения наступает сразу же), поэтому без такого счётчика пара
+      «нажатие → «не знаю»» ходила бы по кругу одного слова, и запрос никогда не
+      сообщил бы, что план дня выполнен (см. :mod:`services.delivery`).
+
+    Считаются отправки из любого источника — расписание и ручной запрос вместе:
+    иначе слово, которое слоты присылают после каждого «не знаю», кнопка повторяла
+    бы бесконечно.
     """
     moment = now or utcnow()
     day_start = slots.local_day_start_utc(user, moment)
-    skipped = set(await repository.fetch_shown_word_ids_since(session, user, since=day_start))
-    last_word_id = await repository.fetch_last_delivered_word_id(session, user)
-    if last_word_id is not None:
-        skipped.add(last_word_id)
+    skipped = set(await hanging_card_word_ids(session, user, moment))
+    skipped |= set(
+        await repository.fetch_word_ids_sent_at_least(
+            session,
+            user,
+            since=day_start,
+            count=config.ON_DEMAND_MAX_SENDS_PER_DAY,
+        )
+    )
     return skipped
 
 
@@ -251,21 +384,17 @@ async def hanging_card_word_ids(
     )
 
 
-async def has_candidate_word(session: AsyncSession, user: User, now: datetime) -> bool:
-    """Есть ли вообще слово, которое можно было бы отправить без исключений.
+async def words_shown_today(
+    session: AsyncSession, user: User, now: datetime | None = None
+) -> bool:
+    """Приходило ли пользователю сегодня хоть одно слово.
 
-    Нужно, чтобы объяснить пользователю пустую очередь: ``False`` — слов нет по
-    настройкам (фильтр по части речи, лимит в изучении, пустой словарь), а
-    ``True`` при пустом ``/word`` означает, что всё доступное уже приходило
-    сегодня (см. :func:`handlers.common.no_word_text`).
-
-    Проверка идёт с ``allow_waiting_card=True``: вопрос не в том, пришлёт ли бот
-    слово прямо сейчас, а в том, есть ли оно в очереди вообще — ручной запрос как
-    раз и не повторяет сегодняшние карточки (:func:`on_demand_exclusions`).
+    Нужно, чтобы объяснить пустую очередь ручного запроса: если сегодня показы уже
+    были, причина пустого ``/word`` — выполненный план дня (слова дня уже приходили,
+    а лимит показов за сутки исчерпан), а не настройки вроде фильтра по части речи
+    или пустого словаря (см. :func:`handlers.common.no_word_text`).
     """
-    if await select_main_word(session, user, now, allow_waiting_card=True) is not None:
-        return True
-    candidates = await repository.fetch_refresh_user_words(
-        session, user, now, 1, user.pos_filter_values
-    )
-    return bool(candidates)
+    moment = now or utcnow()
+    day_start = slots.local_day_start_utc(user, moment)
+    shown = await repository.fetch_shown_word_ids_since(session, user, since=day_start)
+    return bool(shown)

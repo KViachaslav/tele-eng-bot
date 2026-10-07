@@ -297,3 +297,31 @@ def test_local_day_end_utc_counts_days_by_user_timezone() -> None:
     assert slots.local_day_end_utc(utc_user, datetime(2026, 1, 15, 9, 0)) == datetime(
         2026, 1, 16, 0, 0
     )
+
+
+def test_local_date_rolls_over_by_user_timezone() -> None:
+    """Местная дата: 21:30 UTC — это уже следующие сутки по Москве."""
+    moscow = make_user(timezone_name="Europe/Moscow")
+
+    assert slots.local_date(moscow, datetime(2026, 1, 14, 20, 30)) == date(2026, 1, 14)
+    assert slots.local_date(moscow, datetime(2026, 1, 14, 21, 30)) == date(2026, 1, 15)
+
+
+def test_local_day_bounds_utc_uses_local_date() -> None:
+    """Границы выбранных суток: для Москвы 15 января — 21:00 UTC 14-го и 15-го."""
+    moscow = make_user(timezone_name="Europe/Moscow")
+
+    assert slots.local_day_bounds_utc(moscow, date(2026, 1, 15)) == (
+        datetime(2026, 1, 14, 21, 0),
+        datetime(2026, 1, 15, 21, 0),
+    )
+
+
+def test_local_day_start_and_end_come_from_bounds() -> None:
+    """``local_day_start_utc`` и ``local_day_end_utc`` — границы текущих суток."""
+    moscow = make_user(timezone_name="Europe/Moscow")
+    now = datetime(2026, 1, 15, 9, 0)
+    start, end = slots.local_day_bounds_utc(moscow, slots.local_date(moscow, now))
+
+    assert slots.local_day_start_utc(moscow, now) == start
+    assert slots.local_day_end_utc(moscow, now) == end

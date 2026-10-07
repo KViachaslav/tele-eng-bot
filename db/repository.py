@@ -409,6 +409,28 @@ def waiting_for_repeat_condition(
     )
 
 
+def sent_today_subquery(user: User, since: datetime) -> Subquery:
+    """Подзапрос «сколько раз слово приходило пользователю с момента ``since``».
+
+    Считает отправки с начала местных суток пользователя
+    (:func:`services.slots.local_day_start_utc`) и отдельно — сколько из них уже
+    отвечено. По этому подзапросу видно, какие слова дня можно повторить вручную:
+    карточка уходила один раз и ответ получен (см.
+    :func:`fetch_repeat_user_words`).
+    """
+    return (
+        select(
+            DeliveryLog.word_id.label("word_id"),
+            func.count().label("sent_count"),
+            func.count(DeliveryLog.answered_at).label("answered_count"),
+            func.min(DeliveryLog.sent_at).label("first_sent_at"),
+        )
+        .where(DeliveryLog.user_id == user.id, DeliveryLog.sent_at >= since)
+        .group_by(DeliveryLog.word_id)
+        .subquery()
+    )
+
+
 async def fetch_due_user_words(
     session: AsyncSession,
     user: User,
@@ -456,6 +478,57 @@ async def fetch_due_user_words(
         stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
             waiting_for_repeat_condition(last_sent, not_shown_since)
         )
+    if exclude_word_ids:
+        stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def fetch_repeat_user_words(
+    session: AsyncSession,
+    user: User,
+    *,
+    since: datetime,
+    limit: int,
+    pos_values: Sequence[str] = (),
+    exclude_word_ids: Sequence[int] = (),
+) -> Sequence[UserWord]:
+    """Слова дня, которые можно пройти **заново** вручную.
+
+    В выборку попадают слова «в изучении», у которых с момента ``since`` (начало
+    местных суток пользователя) ровно одна отправка и на неё уже ответили. Это и
+    есть «слова дня»: кнопка «🎲 Слово» отдаёт их, когда план дня уже выполнен, —
+    чтобы день можно было повторить целиком (см.
+    :func:`services.word_selector.select_repeat_word`).
+
+    Карточка без ответа не подходит: в чате оказались бы две одинаковые карточки, а
+    прогресс от второй отправки не меняется. Слова, приходившие сегодня дважды, тоже
+    не подходят: общее ограничение ``config.ON_DEMAND_MAX_SENDS_PER_DAY`` не даёт
+    ручному запросу ходить по кругу одного слова.
+
+    :param exclude_word_ids: слова, которые сейчас показывать не нужно
+        (см. :func:`services.word_selector.on_demand_exclusions`).
+    """
+    sent = sent_today_subquery(user, since)
+    stmt = (
+        select(UserWord)
+        .join(Word, Word.id == UserWord.word_id)
+        .join(sent, sent.c.word_id == UserWord.word_id)
+        .where(
+            UserWord.user_id == user.id,
+            UserWord.status == config.STATUS_LEARNING,
+            UserWord.is_refresh.is_(False),
+            sent.c.sent_count == 1,
+            sent.c.answered_count == 1,
+        )
+        # Порядок показа сегодня: слова дня идут так, как приходили.
+        .order_by(sent.c.first_sent_at.asc(), UserWord.id.asc())
+        .limit(limit)
+        .options(joinedload(UserWord.word))
+    )
     if exclude_word_ids:
         stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
     condition = build_pos_filter_condition(pos_values)
@@ -553,9 +626,8 @@ async def fetch_shown_word_ids_since(
 
     Ответ роли не играет: и карточка без ответа, и слово, на которое ответили
     «не знаю» (этап 0 — срок повторения наступает сразу же), уже были в чате
-    сегодня. Показывать такое слово снова подряд нельзя, иначе ручной запрос
-    ``/word`` ходит по кругу одних и тех же слов (см.
-    :func:`services.word_selector.on_demand_exclusions`).
+    сегодня. По этому признаку ручной запрос объясняет пустую очередь планом дня
+    (см. :func:`services.word_selector.words_shown_today`).
 
     :param since: если задано, учитываются только отправки не раньше этого
         момента. Карточка, оставшаяся без ответа накануне, из очереди не
@@ -569,6 +641,27 @@ async def fetch_shown_word_ids_since(
     if since is not None:
         stmt = stmt.where(DeliveryLog.sent_at >= since)
     result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def fetch_word_ids_sent_at_least(
+    session: AsyncSession, user: User, *, since: datetime, count: int
+) -> Sequence[int]:
+    """Слова, карточки которых приходили пользователю не меньше ``count`` раз.
+
+    Отправки считаются с момента ``since`` — для ручного запроса это начало местных
+    суток пользователя (:func:`services.slots.local_day_start_utc`). Так ручной
+    запрос перестаёт предлагать слово, которое сегодня уже исчерпало свой лимит
+    показов (``config.ON_DEMAND_MAX_SENDS_PER_DAY``): план дня от этого не страдает
+    (слово уже приходило), а кнопка не ходит по кругу одного и того же слова (см.
+    :func:`services.word_selector.on_demand_exclusions`).
+    """
+    result = await session.execute(
+        select(DeliveryLog.word_id)
+        .where(DeliveryLog.user_id == user.id, DeliveryLog.sent_at >= since)
+        .group_by(DeliveryLog.word_id)
+        .having(func.count() >= count)
+    )
     return result.scalars().all()
 
 
@@ -599,17 +692,6 @@ async def fetch_unanswered_word_ids_since(
         stmt = stmt.where(DeliveryLog.sent_at >= since)
     result = await session.execute(stmt)
     return result.scalars().all()
-
-
-async def fetch_last_delivered_word_id(session: AsyncSession, user: User) -> int | None:
-    """Слово из самой последней отправки пользователю (даже если на неё ответили)."""
-    result = await session.execute(
-        select(DeliveryLog.word_id)
-        .where(DeliveryLog.user_id == user.id)
-        .order_by(DeliveryLog.sent_at.desc(), DeliveryLog.id.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
 
 
 # ---------------------------------------------------------------------------
@@ -659,11 +741,35 @@ async def count_started_words_since(session: AsyncSession, user: User, since: da
     return int(result.scalar_one())
 
 
+async def count_new_user_words(
+    session: AsyncSession, user: User, pos_values: Sequence[str] = ()
+) -> int:
+    """Сколько слов словаря пользователь ещё ни разу не начинал.
+
+    Это запас новых слов для прогноза «📅 План слов»: слов дня не может быть
+    больше, чем осталось неизученных, даже если ``users.words_per_day`` больше
+    (см. :func:`services.plan.upcoming_plan`). Условие «ещё не начинал» — то же,
+    что и в :func:`fetch_new_words`: у слова нет строки в ``user_words``.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(Word)
+        .outerjoin(UserWord, and_(UserWord.word_id == Word.id, UserWord.user_id == user.id))
+        .where(UserWord.id.is_(None))
+    )
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
+    return int(result.scalar_one())
+
+
 async def count_pending_review_user_words(
     session: AsyncSession,
     user: User,
     until: datetime,
     *,
+    since: datetime | None = None,
     not_shown_since: datetime | None = None,
     pos_values: Sequence[str] = (),
 ) -> int:
@@ -675,6 +781,10 @@ async def count_pending_review_user_words(
     сброшенные на этап 0 ответом «не знаю». Выученные слова и освежение не
     считаются: они приходят отдельным сообщением в том же слоте, места не занимая.
 
+    :param since: если задано, считаются только слова, срок которых наступает
+        *после* этого момента: так прогноз на будущие дни
+        (:func:`services.plan.upcoming_plan`) раскладывает повторения по суткам,
+        не повторяя просроченные слова в каждом следующем дне.
     :param not_shown_since: если задано, уже показанные с этого момента слова не
         считаются — кроме тех, на которые с тех пор ответили: «не знаю» возвращает
         слово на этап 0, и оно должно прийти снова (см.
@@ -697,6 +807,8 @@ async def count_pending_review_user_words(
             UserWord.next_review_at <= until,
         )
     )
+    if since is not None:
+        stmt = stmt.where(UserWord.next_review_at > since)
     if not_shown_since is not None:
         last_sent = last_sent_subquery(user)
         stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(

@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -304,3 +304,108 @@ async def test_plan_respects_pos_filter(session, user, words, now) -> None:
 
     # Осталось повторение наречия; новых слов нет: остальные слова уже начаты.
     assert await plan.words_left_today(session, user, now) == 1
+
+
+# ---------------------------------------------------------------------------
+# Прогноз на несколько дней: экран «📅 План слов»
+# ---------------------------------------------------------------------------
+async def test_upcoming_plan_starts_with_today(session, user, words, now) -> None:
+    """Первый день прогноза — сегодня, и он совпадает с планом дня.
+
+    Новые слова здесь ограничены ещё и словарём: неизученных слов три, а норма —
+    два, поэтому на сегодня попадают ровно два (``words_left_today`` при нехватке
+    слов оставляет в плане больше — лишнего просто не найдётся при отправке).
+    """
+    await repository.update_user(session, user, words_per_day=2)
+
+    days = await plan.upcoming_plan(session, user, now, config.FORECAST_DAYS)
+
+    assert [day.local_day for day in days] == [
+        date(2026, 1, 15),
+        date(2026, 1, 16),
+        date(2026, 1, 17),
+    ]
+    assert days[0].total == await plan.words_left_today(session, user, now)
+
+
+async def test_upcoming_plan_spends_new_words_day_by_day(session, user, words, now) -> None:
+    """Новые слова расходуются по дням: три неизученных при норме два — 2, 1, 0."""
+    await repository.update_user(session, user, words_per_day=2)
+
+    days = await plan.upcoming_plan(session, user, now, 3)
+
+    assert [day.new_words for day in days] == [2, 1, 0]
+    assert [day.total for day in days] == [2, 1, 0]
+
+
+async def test_upcoming_plan_puts_due_reviews_into_their_days(session, user, words, now) -> None:
+    """Повторение попадает в те сутки, на которые приходится его срок.
+
+    Слово, срок которого наступает завтра, сегодня не планируется, зато завтра
+    занимает место рядом с новыми словами. В третий день оно не считается
+    повторно: просроченные слова прогноз не дублирует по дням. Новых слов всего
+    два (одно уже в изучении), поэтому к третьему дню они заканчиваются.
+    """
+    await repository.update_user(session, user, words_per_day=1)
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE + 1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now + timedelta(days=1),
+        last_reviewed_at=now,
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+    days = await plan.upcoming_plan(session, user, now, 3)
+
+    assert [(day.new_words, day.reviews) for day in days] == [(1, 0), (1, 1), (0, 0)]
+
+
+async def test_upcoming_plan_has_no_new_words_at_learning_limit(
+    session, user, words, now
+) -> None:
+    """Достигнут лимит слов в изучении — во все дни приходят только повторения."""
+    await repository.update_user(session, user, words_per_day=5, learning_limit=1)
+    await put_due(session, user.id, words[0].id, now, days_ago=1)
+
+    days = await plan.upcoming_plan(session, user, now, 3)
+
+    assert [day.new_words for day in days] == [0, 0, 0]
+    assert [day.reviews for day in days] == [1, 0, 0]
+
+
+async def test_upcoming_plan_skips_learned_words(session, user, words, now) -> None:
+    """Выученное слово прогноз не занимает: на освежение оно придёт отдельно."""
+    await repository.update_user(session, user, words_per_day=1)
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_MAX_STAGE,
+        status=config.STATUS_LEARNED,
+        next_review_at=now + timedelta(days=1),
+        last_reviewed_at=now,
+        times_correct=config.SRS_MAX_STAGE,
+        times_wrong=0,
+        is_refresh=True,
+    )
+
+    days = await plan.upcoming_plan(session, user, now, 2)
+
+    assert [day.reviews for day in days] == [0, 0]
+
+
+async def test_upcoming_plan_respects_pos_filter(session, user, words, now) -> None:
+    """Фильтр частей речи убирает из прогноза и новые слова, и повторения."""
+    await repository.update_user(session, user, words_per_day=1)
+    await put_due(session, user.id, words[0].id, now, days_ago=1)  # apple — noun
+    await repository.set_pos_filter(session, user, [config.POS_ADVERB])
+
+    days = await plan.upcoming_plan(session, user, now, 3)
+
+    # Новое слово осталось только наречие quickly; повторение существительного скрыто.
+    assert [(day.new_words, day.reviews) for day in days] == [(1, 0), (0, 0), (0, 0)]

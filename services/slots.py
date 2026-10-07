@@ -227,6 +227,30 @@ def is_within_window(user: User, now_utc: datetime) -> bool:
     return start_seconds <= now_seconds <= end_seconds + config.WINDOW_TOLERANCE_SECONDS
 
 
+def local_date(user: User, moment_utc: datetime) -> date:
+    """Местная дата пользователя для момента ``moment_utc``.
+
+    Сутки считаются по часовому поясу пользователя: для ``Europe/Moscow`` момент
+    21:30 UTC — это уже следующие сутки (00:30 по Москве). Из этой даты строятся
+    границы суток (:func:`local_day_bounds_utc`) и прогноз на несколько дней
+    (:func:`services.plan.upcoming_plan`).
+    """
+    return as_utc(moment_utc).astimezone(user.tzinfo).date()
+
+
+def local_day_bounds_utc(user: User, local_day: date) -> tuple[datetime, datetime]:
+    """Границы местных суток ``local_day`` в наивном UTC (как даты в БД).
+
+    Возвращает ``(начало, конец)``: полночь выбранных суток по поясу пользователя
+    и полночь следующих суток. Для ``Europe/Moscow`` 15 января — это 21:00 UTC
+    14 января и 21:00 UTC 15 января.
+    """
+    local_start = datetime.combine(local_day, time.min, tzinfo=user.tzinfo)
+    start = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    end = (local_start + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None)
+    return start, end
+
+
 def local_day_start_utc(user: User, now_utc: datetime) -> datetime:
     """Начало текущих суток пользователя, в наивном UTC (как даты в БД).
 
@@ -236,9 +260,7 @@ def local_day_start_utc(user: User, now_utc: datetime) -> datetime:
     второй раз в тот же день и чтобы карточка без ответа, отправленная вчера, не
     исключала слово из очереди навсегда.
     """
-    local_now = as_utc(now_utc).astimezone(user.tzinfo)
-    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    return local_day_bounds_utc(user, local_date(user, now_utc))[0]
 
 
 def local_day_end_utc(user: User, now_utc: datetime) -> datetime:
@@ -248,9 +270,7 @@ def local_day_end_utc(user: User, now_utc: datetime) -> datetime:
     срок повторения которых наступает в течение сегодняшних суток пользователя
     (см. :func:`services.plan.words_left_today`).
     """
-    local_now = as_utc(now_utc).astimezone(user.tzinfo)
-    local_end = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    return local_end.astimezone(timezone.utc).replace(tzinfo=None)
+    return local_day_bounds_utc(user, local_date(user, now_utc))[1]
 
 
 def as_utc(moment: datetime) -> datetime:

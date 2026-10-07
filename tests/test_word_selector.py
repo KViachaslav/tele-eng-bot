@@ -7,6 +7,14 @@
 (этап 0), поэтому очередь зацикливалась на одних и тех же словах и новые не
 приходили. По той же причине в рассылке по слотам одно слово приходило подряд,
 пока не закрывалось окно.
+
+Отдельно проверяется ручной запрос «дай слово»: он идёт по плану дня
+(:func:`services.word_selector.select_plan_word` — повторения со сроком до конца
+местных суток, затем новое слово), а после выполнения плана отдаёт слова дня,
+которые уже приходили и получили ответ (:func:`select_repeat_word`). Зациклиться
+на одном слове не даёт :func:`on_demand_exclusions`: висящая карточка не
+повторяется, а слово, исчерпавшее лимит показов за сутки
+(``config.ON_DEMAND_MAX_SENDS_PER_DAY``), ручной запрос больше не присылает.
 """
 from __future__ import annotations
 
@@ -210,13 +218,14 @@ async def test_hanging_card_word_ids_skip_only_todays_cards(session, user, words
 
 
 # ---------------------------------------------------------------------------
-# Исключения для ручного запроса «дай слово»
+# Ручной запрос «дай слово»: ограничения против повторов
 # ---------------------------------------------------------------------------
-async def test_on_demand_exclusions_skip_only_todays_cards(session, user, words, now) -> None:
-    """Карточка без ответа из прошлого не исключает слово из ``/word`` навсегда.
+async def test_on_demand_exclusions_skip_hanging_cards(session, user, words, now) -> None:
+    """Висящая карточка ручному запросу слово не отдаёт, а вчерашняя слову не мешает.
 
-    Регрессия: слово, чью карточку пользователь не закрыл накануне, выпадало из
-    очереди ручного запроса до тех пор, пока на эту карточку не ответят.
+    Карточка без ответа в чате: повтор прогресс не двигает, а две одинаковые
+    карточки подряд ни к чему. Карточка прошлых суток перед глазами уже не «висит»
+    и слово из очереди не вытесняет (см. :func:`services.slots.local_day_start_utc`).
     """
     await show_word(session, user, words[0].id, now, hours_ago=30)
     await show_word(session, user, words[1].id, now)
@@ -227,16 +236,21 @@ async def test_on_demand_exclusions_skip_only_todays_cards(session, user, words,
     assert words[0].id not in skipped
 
 
-async def test_on_demand_exclusions_skip_word_answered_today(session, user, words, now) -> None:
-    """Слово, на которое сегодня ответили «не знаю», в ручной запрос не вернётся.
+async def test_on_demand_exclusions_skip_word_sent_twice_today(session, user, words, now) -> None:
+    """Слово, приходившее сегодня дважды, ручной запрос заново не отдаёт.
 
-    Регрессия: ответ обнуляет срок повторения (этап 0 — слово снова «на сегодня»),
-    а исключалась только самая последняя отправка — поэтому ``/word`` ходил по
-    кругу из двух-трёх слов, которые пользователь только что ответил.
+    Ответ «не знаю» возвращает слово на этап 0 (срок повторения наступает сразу),
+    и без счётчика показов пара «нажатие → «не знаю»» ходила бы по кругу одного
+    слова: запрос никогда не сообщил бы, что план дня выполнен
+    (``config.ON_DEMAND_MAX_SENDS_PER_DAY``).
     """
-    delivery_log = await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
+    first = await show_word(session, user, words[0].id, now, hours_ago=2)
     await repository.mark_delivery_answered(
-        session, delivery_log, config.ANSWER_DONT_KNOW, answered_at=now
+        session, first, config.ANSWER_DONT_KNOW, answered_at=now - timedelta(hours=2)
+    )
+    second = await show_word(session, user, words[0].id, now, hours_ago=1)
+    await repository.mark_delivery_answered(
+        session, second, config.ANSWER_DONT_KNOW, answered_at=now - timedelta(minutes=30)
     )
 
     skipped = await word_selector.on_demand_exclusions(session, user, now)
@@ -244,38 +258,119 @@ async def test_on_demand_exclusions_skip_word_answered_today(session, user, word
     assert words[0].id in skipped
 
 
-async def test_on_demand_exclusions_skip_last_delivered_word(session, user, words, now) -> None:
-    """Последнее отправленное слово исключается, даже если оно из прошлого дня."""
-    delivery = await repository.create_delivery(session, user.id, words[0].id, sent_at=now)
-    await repository.mark_delivery_answered(
-        session, delivery, config.ANSWER_DONT_KNOW, answered_at=now
+# ---------------------------------------------------------------------------
+# План дня и повтор дня: что отдаёт кнопка «🎲 Слово»
+# ---------------------------------------------------------------------------
+async def test_select_plan_word_takes_review_due_later_today(session, user, words, now) -> None:
+    """Повторение со сроком позже «сейчас», но до конца суток, попадает в план дня.
+
+    План дня считает слова до конца местных суток
+    (:func:`services.slots.local_day_end_utc`), поэтому кнопкой «🎲 Слово» день можно
+    пройти досрочно: раньше запрос смотрел на «сейчас» и отдавал только
+    просроченные слова, а слова с вечерним сроком ждали расписания.
+    """
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now + timedelta(hours=5),
+        last_reviewed_at=now - timedelta(days=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
     )
 
-    skipped = await word_selector.on_demand_exclusions(session, user, now)
+    selected = await word_selector.select_plan_word(session, user, now)
 
-    assert skipped == {words[0].id}
+    assert selected is not None
+    assert selected.word.word == "apple"
+    assert selected.user_word is not None
 
 
-# ---------------------------------------------------------------------------
-# Пустая очередь: есть ли слово вообще
-# ---------------------------------------------------------------------------
-async def test_has_candidate_word_sees_word_shown_today(session, user, words, now) -> None:
-    """Слово показывали сегодня — очередь пуста именно из-за показа.
-
-    Фильтр по части речи оставляет одно слово: новых слов нет, а оно уже в чате.
-    Так бот понимает, что причина пустого ``/word`` — сегодняшние отправки, и
-    говорит об этом пользователю (см. :func:`handlers.common.no_word_text`).
-    """
+async def test_select_plan_word_ignores_review_due_tomorrow(session, user, words, now) -> None:
+    """Повторение со сроком на завтра в план дня не попадает: его ждёт расписание."""
     await repository.set_pos_filter(session, user, {config.POS_NOUN})
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now + timedelta(days=1),
+        last_reviewed_at=now - timedelta(days=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+    assert await word_selector.select_plan_word(session, user, now) is None
+
+
+async def test_select_repeat_word_returns_answered_today_word(session, user, words, now) -> None:
+    """Слово дня, отвеченное сегодня, можно пройти заново.
+
+    План дня выполнен (слово ушло в будущее), но карточка сегодня уже была и ответ
+    получен — повторный проход отдаёт это слово.
+    """
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now + timedelta(days=1),
+        last_reviewed_at=now - timedelta(minutes=5),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    delivery = await show_word(session, user, words[0].id, now, hours_ago=1)
+    await repository.mark_delivery_answered(
+        session, delivery, config.ANSWER_KNOW, answered_at=now - timedelta(minutes=5)
+    )
+
+    selected = await word_selector.select_repeat_word(session, user, now)
+
+    assert selected is not None
+    assert selected.word.word == "apple"
+
+
+async def test_select_repeat_word_skips_hanging_and_sent_twice(session, user, words, now) -> None:
+    """Висящая карточка и слово, приходившее дважды, в повтор дня не попадают."""
     await put_in_learning(session, user.id, words[0].id, now, hours_ago=1)
+    await show_word(session, user, words[0].id, now)  # карточка висит без ответа
+    await put_in_learning(session, user.id, words[1].id, now, hours_ago=2)
+    first = await show_word(session, user, words[1].id, now, hours_ago=2)
+    await repository.mark_delivery_answered(
+        session, first, config.ANSWER_KNOW, answered_at=now - timedelta(hours=2)
+    )
+    second = await show_word(session, user, words[1].id, now, hours_ago=1)
+    await repository.mark_delivery_answered(
+        session, second, config.ANSWER_KNOW, answered_at=now - timedelta(minutes=30)
+    )
+
+    assert await word_selector.select_repeat_word(session, user, now) is None
+
+
+# ---------------------------------------------------------------------------
+# Пустая очередь: приходили ли слова сегодня
+# ---------------------------------------------------------------------------
+async def test_words_shown_today_true_after_delivery(session, user, words, now) -> None:
+    """После сегодняшней отправки ручной запрос объясняет пустую очередь планом дня.
+
+    Слова показывали сегодня — значит причина пустого ``/word`` именно в этом, и бот
+    говорит о выполненном плане, а не о фильтре по части речи или лимите
+    (:func:`handlers.common.no_word_text`).
+    """
     await show_word(session, user, words[0].id, now)
 
-    assert await word_selector.has_candidate_word(session, user, now) is True
+    assert await word_selector.words_shown_today(session, user, now) is True
 
 
-async def test_has_candidate_word_false_without_words(session, user, words, now) -> None:
-    """Ни одного кандидата: слов нет по настройкам, а не из-за сегодняшних показов."""
-    await repository.update_user(session, user, words_per_day=1)
-    await show_word(session, user, words[0].id, now)
+async def test_words_shown_today_false_without_deliveries(session, user, words, now) -> None:
+    """Карточка прошлых суток — сегодняшних показов нет."""
+    await show_word(session, user, words[0].id, now, hours_ago=30)
 
-    assert await word_selector.has_candidate_word(session, user, now) is False
+    assert await word_selector.words_shown_today(session, user, now) is False

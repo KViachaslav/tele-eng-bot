@@ -187,6 +187,7 @@ def settings_menu_keyboard(user: User, settings: UserSettings) -> InlineKeyboard
         [_button(texts.BTN_SETTINGS_LIMIT, pack(config.ACTION_LEARNING_LIMIT))],
         [_button(texts.BTN_SETTINGS_WINDOW, pack(config.ACTION_WINDOW))],
         [_button(texts.BTN_SETTINGS_TIMEZONE, pack(config.ACTION_TIMEZONE))],
+        [_button(texts.BTN_SETTINGS_FORECAST, pack(config.ACTION_FORECAST))],
         [_button(f"{texts.BTN_SETTINGS_FIELDS} · {fields_count}", pack(config.ACTION_FIELDS))],
         [_button(texts.BTN_SETTINGS_POS, pack(config.ACTION_POS))],
         [
@@ -298,5 +299,15 @@ def answer_keyboard(word_id: int, delivery_id: int) -> InlineKeyboardMarkup:
         audio_keyboard_row(word_id, delivery_id),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def forecast_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура экрана «📅 План слов»: только возврат в меню настроек.
+
+    Экран ничего не меняет, поэтому кроме «⬅️ Назад» кнопок нет.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[_button(texts.BTN_BACK, settings_callback(config.ACTION_BACK))]]
+    )
 
 
