@@ -36,6 +36,7 @@ from services import translator
 from services.message_builder import build_refresh_card, build_word_card
 from services.word_selector import (
     SelectedWord,
+    hanging_card_word_ids,
     on_demand_exclusions,
     select_main_word,
     select_plan_word,
@@ -164,10 +165,14 @@ async def deliver_main_word(
     *,
     exclude_word_ids: Collection[int] = (),
 ) -> bool:
-    """Отправляет очередное слово из очереди повторений/новых слов.
+    """Отправляет очередное слово очереди слота.
+
+    Очередь идёт по ступеням до конца местных суток пользователя — граница та же,
+    что у плана дня (:func:`services.word_selector.select_main_word`), поэтому любое
+    слово из плана дня может уйти в любой оставшийся слот.
 
     :param exclude_word_ids: слова, которые сейчас присылать не нужно
-        (см. :func:`services.word_selector.on_demand_exclusions`).
+        (см. :func:`services.word_selector.hanging_card_word_ids`).
     """
     selected = await select_main_word(
         session, user, utcnow(), exclude_word_ids=exclude_word_ids
@@ -184,14 +189,16 @@ async def deliver_plan_word(
     *,
     exclude_word_ids: Collection[int] = (),
 ) -> bool:
-    """Отправляет слово из плана дня: повторение со сроком до конца суток или новое.
+    """Отправляет слово из плана дня — то же, что пришло бы по расписанию.
 
-    Этим проходом пользуется ручной запрос «дай слово»: он идёт по плану дня, а не
-    по срочности «пора показать сейчас», поэтому сегодняшние повторения можно
-    пройти досрочно (см. :func:`services.word_selector.select_plan_word`).
+    Этим проходом пользуется ручной запрос «дай слово»: очередь у него и у
+    расписания одна и та же (:func:`services.word_selector.select_plan_word`),
+    поэтому сегодняшние повторения можно пройти досрочно, а отданное слово расходует
+    пункт плана. Лимит показов за сутки здесь не применяется: слово уже приходило, но
+    пункт плана всё ещё занимает — молчать о нём нельзя.
 
     :param exclude_word_ids: слова, которые сейчас присылать не нужно
-        (см. :func:`services.word_selector.on_demand_exclusions`).
+        (см. :func:`services.word_selector.hanging_card_word_ids`).
     """
     selected = await select_plan_word(
         session, user, utcnow(), exclude_word_ids=exclude_word_ids
@@ -250,6 +257,8 @@ async def deliver_slot(bot: Bot, session: AsyncSession, user: User) -> int:
     Освежение идёт отдельным сообщением и не расходует дневной лимит слов.
     Отправка идёт под замком пользователя (:func:`user_send_lock`): слот не
     должен пересечься с нажатием «🎲 Слово» — иначе обе выбирают одно слово.
+    Пустой слот (``0``) планировщик разбирает по логу
+    (:func:`services.plan.describe_empty_queue`).
 
     :return: сколько сообщений со словами было отправлено.
     """
@@ -278,12 +287,13 @@ async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool
        приходили и получили ответ, — чтобы день можно было пройти заново, когда план
        исчерпан.
 
-    Лишний раз то же слово не вернётся: висящая карточка и слова, исчерпавшие лимит
-    показов за сутки, исключены (:func:`services.word_selector.on_demand_exclusions`).
-    Так пара «нажатие → «не знаю»» не ходит по кругу: ответ возвращает слово на
-    этап 0 (то есть в план дня), но после ``config.ON_DEMAND_MAX_SENDS_PER_DAY``
-    показов за сутки очередь его пропускает — и ручной запрос честно сообщает, что
-    план дня выполнен (:func:`handlers.common.no_word_text`).
+    Лишний раз то же слово не вернётся: висящая карточка исключена в обоих проходах
+    (:func:`services.word_selector.hanging_card_word_ids`), а лимит показов за сутки
+    (``config.ON_DEMAND_MAX_SENDS_PER_DAY``) ограничивает только повтор дня
+    (:func:`services.word_selector.on_demand_exclusions`). Так пара «нажатие →
+    «не знаю»» не ходит по кругу: ответ возвращает слово на этап 0 (то есть в план
+    дня), но после лимита показов повторный проход его пропускает — и ручной запрос
+    честно сообщает, что план дня выполнен (:func:`handlers.common.no_word_text`).
 
     Проход идёт под замком пользователя (:func:`user_send_lock`): два быстрых
     нажатия подряд обрабатываются одновременно, и без замка оба успевали выбрать
@@ -292,7 +302,13 @@ async def deliver_on_demand(bot: Bot, session: AsyncSession, user: User) -> bool
     :return: получилось ли отправить карточку.
     """
     async with user_send_lock(user.id):
-        skip = await on_demand_exclusions(session, user)
-        if await deliver_plan_word(bot, session, user, exclude_word_ids=skip):
+        # План дня: лимит показов за сутки сюда не применяется — слово уже приходило,
+        # но пункт плана оно всё ещё занимает, и молчать о нём нельзя (иначе план не
+        # убывал бы от отправок, см. services.word_selector.on_demand_exclusions).
+        hanging = await hanging_card_word_ids(session, user)
+        if await deliver_plan_word(bot, session, user, exclude_word_ids=hanging):
             return True
+        # Повтор дня: здесь лимит как раз и нужен — пройти день заново можно, но не
+        # бесконечно (ответ «не знаю» возвращает слово в план дня со сроком «сразу»).
+        skip = await on_demand_exclusions(session, user)
         return await deliver_repeat_word(bot, session, user, exclude_word_ids=skip)

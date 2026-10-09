@@ -23,7 +23,7 @@ from db.models import DeliveryLog, User, Word, utcnow
 from handlers import common
 from keyboards.callbacks import AnswerCallback, AudioCallback, ShowCallback
 from keyboards.inline import answer_keyboard, audio_keyboard
-from services import audio, delivery, srs, translator
+from services import audio, delivery, slots, srs, translator
 from services.message_builder import build_refresh_card, build_word_card, with_answer_result
 from services.scheduler import SchedulerService
 
@@ -278,7 +278,15 @@ async def on_answer(
         times_wrong=user_word.times_wrong,
         is_refresh=user_word.is_refresh,
     )
-    updated = srs.apply_answer(current, callback_data.answer, now)
+    # Срок повторения сразу сдвигается внутрь окна рассылки: ответ приходит и после
+    # закрытия окна, а слово со сроком «за окном» не может показать ни один слот —
+    # оно висело в плане дня, но слова не приходили (см. services.slots.align_to_window).
+    updated = srs.apply_answer(
+        current,
+        callback_data.answer,
+        now,
+        window=slots.WindowBounds.of(user),
+    )
 
     await repository.save_user_word(
         session,

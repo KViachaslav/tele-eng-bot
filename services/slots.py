@@ -134,9 +134,39 @@ def check_window(start: time, end: time, words_per_day: int) -> WindowCheck:
     return WindowCheck(current_minutes=length, required_minutes=required)
 
 
+@dataclass(frozen=True, slots=True)
+class WindowBounds:
+    """Окно рассылки пользователя: часовой пояс и границы дня в местном времени."""
+
+    tzinfo: ZoneInfo
+    start: time
+    end: time
+
+    @classmethod
+    def of(cls, user: User) -> WindowBounds:
+        """Окно из настроек пользователя."""
+        return cls(tzinfo=user.tzinfo, start=user.window_start_time, end=user.window_end_time)
+
+    def open_at(self, local_day: date) -> datetime:
+        """Момент открытия окна в местном времени пользователя."""
+        return datetime.combine(local_day, self.start, tzinfo=self.tzinfo)
+
+    def close_at(self, local_day: date) -> datetime:
+        """Момент закрытия окна в местном времени пользователя.
+
+        ``00:00`` в поле «конец» — это конец суток (см.
+        :func:`window_length_minutes`), поэтому окно «12:00–00:00» закрывается в
+        полночь следующего дня.
+        """
+        base = datetime.combine(local_day, self.end, tzinfo=self.tzinfo)
+        if self.end == time(0, 0):
+            return base + timedelta(days=1)
+        return base
+
+
 def window_start_datetime(user: User, day: date) -> datetime:
     """Момент начала окна в местном времени пользователя."""
-    return datetime.combine(day, user.window_start_time, tzinfo=user.tzinfo)
+    return WindowBounds.of(user).open_at(day)
 
 
 def window_end_datetime(user: User, day: date) -> datetime:
@@ -145,10 +175,32 @@ def window_end_datetime(user: User, day: date) -> datetime:
     ``00:00`` в поле «конец» — это конец суток (см. :func:`window_length_minutes`),
     поэтому окно «12:00–00:00» закрывается в полночь следующего дня.
     """
-    base = datetime.combine(day, user.window_end_time, tzinfo=user.tzinfo)
-    if user.window_end_time == time(0, 0):
-        return base + timedelta(days=1)
-    return base
+    return WindowBounds.of(user).close_at(day)
+
+
+def align_to_window(bounds: WindowBounds, moment_utc: datetime) -> datetime:
+    """Сдвигает срок повторения внутрь окна рассылки (наивный UTC, как в БД).
+
+    Рассылка работает только внутри окна, поэтому срок, попавший за его закрытие,
+    показывать нечем: слово стоит в плане дня, но ни один слот его не отправляет —
+    оставшиеся слова загоняли интервал в минимум, и день заканчивался без слов
+    (в базе 09.10.2026 «план дня 2», «отправлено 0»: слова ждали 18:08 и 18:10 при
+    окне до 18:00). Ответ на карточку приходил уже после закрытия окна — отсюда и
+    такой срок, поэтому сдвиг делается при записи ответа
+    (:func:`services.srs.apply_answer`).
+
+    Сдвиг — на **открытие окна тех же местных суток**, к которым относится срок:
+    попав за закрытие, слово вернётся в начале того же дня и сразу станет
+    просроченным (то есть попадёт в ближайший слот), а попав раньше открытия — в
+    начале дня, чтобы слово не потерялось в ночном слоте.
+    """
+    moment = as_utc(moment_utc)
+    local = moment.astimezone(bounds.tzinfo)
+    opened = bounds.open_at(local.date())
+    closed = bounds.close_at(local.date())
+    if local < opened or local >= closed:
+        return opened.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment.replace(tzinfo=None)
 
 
 def window_minutes_left(user: User, now_utc: datetime) -> int:

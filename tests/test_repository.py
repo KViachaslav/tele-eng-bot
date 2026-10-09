@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 import config
 from db import repository
 from db.models import UserWord
@@ -671,4 +673,167 @@ async def test_pending_translations_is_zero_for_translated_dictionary(session, w
 
     assert (pending.words, pending.chars) == (0, 0)
     assert list(await repository.get_words_without_translations(session)) == []
+
+
+
+# ---------------------------------------------------------------------------
+# Очередь по ступеням и диагностика пустого слота
+# ---------------------------------------------------------------------------
+async def put_stage(
+    session: AsyncSession,
+    user_id: int,
+    word_id: int,
+    *,
+    stage: int,
+    due_at: datetime,
+    reviewed_at: datetime,
+) -> None:
+    """Готовит слово нужного этапа с заданным сроком повторения."""
+    progress = await repository.get_or_create_user_word(session, user_id, word_id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=stage,
+        status=config.STATUS_LEARNING,
+        next_review_at=due_at,
+        last_reviewed_at=reviewed_at,
+        times_correct=stage,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+
+async def test_queue_words_follow_stage_priority(session, user, words, now) -> None:
+    """Очередь идёт по ступеням: этап 5 → этап 1 → этап 0 «не сегодня».
+
+    Порядок — из ТЗ («Порядок очереди»): чем выше этап, тем важнее повтор
+    (см. :func:`repository.queue_rank`).
+    """
+    day_start = now - timedelta(hours=3)
+    await put_stage(
+        session,
+        user.id,
+        words[0].id,
+        stage=1,
+        due_at=now - timedelta(days=1),
+        reviewed_at=now - timedelta(days=1),
+    )
+    await put_stage(
+        session,
+        user.id,
+        words[1].id,
+        stage=5,
+        due_at=now - timedelta(days=2),
+        reviewed_at=now - timedelta(days=2),
+    )
+    await put_stage(
+        session,
+        user.id,
+        words[2].id,
+        stage=0,
+        due_at=now - timedelta(hours=4),
+        reviewed_at=now - timedelta(hours=4),
+    )
+
+    queue = await repository.fetch_queue_words(
+        session, user, due_until=now, limit=10, day_start=day_start
+    )
+
+    # Пятый этап важнее первого, оба важнее этапа 0, повторённого не сегодня.
+    assert [item.word.word for item in queue] == ["quickly", "apple", "curious"]
+
+
+async def test_queue_words_put_stage_zero_shown_today_last(session, user, words, now) -> None:
+    """Этап 0, повторённый сегодня, уходит в конец очереди.
+
+    Проверяется именно ступень, а не срок: слово этапа 0 «сегодня» ждало показа
+    дольше остальных, поэтому по одному сроку оно оказалось бы первым.
+    """
+    day_start = now - timedelta(hours=3)
+    await put_stage(
+        session,
+        user.id,
+        words[0].id,
+        stage=0,
+        due_at=now - timedelta(minutes=5),
+        reviewed_at=now - timedelta(minutes=5),
+    )
+    await put_stage(
+        session,
+        user.id,
+        words[1].id,
+        stage=0,
+        due_at=now - timedelta(hours=4),
+        reviewed_at=now - timedelta(hours=4),
+    )
+
+    queue = await repository.fetch_queue_words(
+        session, user, due_until=now, limit=10, day_start=day_start
+    )
+
+    assert [item.word.word for item in queue] == ["quickly", "apple"]
+
+
+async def test_due_queue_by_stage_counts_only_sendable(session, user, words, now) -> None:
+    """``count_due_queue_by_stage`` считает то же, что очередь: без висящих карточек."""
+    day_start = now - timedelta(hours=3)
+    await put_stage(
+        session,
+        user.id,
+        words[0].id,
+        stage=1,
+        due_at=now - timedelta(days=1),
+        reviewed_at=now - timedelta(days=1),
+    )
+    await put_stage(
+        session,
+        user.id,
+        words[1].id,
+        stage=0,
+        due_at=now - timedelta(hours=2),
+        reviewed_at=now - timedelta(hours=2),
+    )
+
+    counts = await repository.count_due_queue_by_stage(
+        session, user, now, not_shown_since=day_start
+    )
+    assert counts == {0: 1, 1: 1}
+
+    # Карточка висит в чате без ответа — очередь такое слово пропускает.
+    await repository.create_delivery(
+        session, user.id, words[1].id, sent_at=now - timedelta(hours=1)
+    )
+    counts = await repository.count_due_queue_by_stage(
+        session, user, now, not_shown_since=day_start
+    )
+
+    assert counts == {1: 1}
+
+
+async def test_nearest_review_at_sees_only_future_due(session, user, words, now) -> None:
+    """``fetch_nearest_review_at`` показывает срок, который ещё не наступил.
+
+    Это ответ на вопрос «почему слот пустой, хотя план дня непуст»: слово ждёт срока
+    за пределами окна рассылки (см. :func:`services.plan.describe_empty_queue`).
+    """
+    await put_stage(
+        session,
+        user.id,
+        words[0].id,
+        stage=1,
+        due_at=now - timedelta(days=1),
+        reviewed_at=now - timedelta(days=1),
+    )
+    await put_stage(
+        session,
+        user.id,
+        words[1].id,
+        stage=1,
+        due_at=now + timedelta(hours=8),
+        reviewed_at=now - timedelta(days=1),
+    )
+
+    nearest = await repository.fetch_nearest_review_at(session, user, since=now)
+
+    assert nearest == now + timedelta(hours=8)
 

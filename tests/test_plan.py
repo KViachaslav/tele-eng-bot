@@ -409,3 +409,38 @@ async def test_upcoming_plan_respects_pos_filter(session, user, words, now) -> N
 
     # Новое слово осталось только наречие quickly; повторение существительного скрыто.
     assert [(day.new_words, day.reviews) for day in days] == [(1, 0), (0, 0), (0, 0)]
+
+
+# ---------------------------------------------------------------------------
+# Диагностика пустого слота
+# ---------------------------------------------------------------------------
+async def test_describe_empty_queue_reports_reason(session, user, words, now) -> None:
+    """Пустой слот объясняется планом дня, очередью по этапам и ближайшим сроком.
+
+    Ради этого отчёта и появилась диагностика: без неё в логе рядом стояли «план дня
+    2» и «слов отправлено 0» (09.10.2026), а причину приходилось искать запросами к
+    базе (см. :func:`services.plan.describe_empty_queue`).
+    """
+    await repository.update_user(session, user, learning_limit=1)
+    await put_due(session, user.id, words[0].id, now, days_ago=1)
+    progress = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=now + timedelta(hours=3),
+        last_reviewed_at=now - timedelta(hours=1),
+        times_correct=0,
+        times_wrong=1,
+        is_refresh=False,
+    )
+
+    report = await plan.describe_empty_queue(session, user, now)
+
+    assert "план дня 2 (новых 0, повторений 2)" in report
+    assert "этап 0 — 1, этап 1 — 1" in report
+    assert "висящих карточек 0" in report
+    assert "ближайший срок 15.01 15:00" in report
+    assert "окно 09:00–21:00" in report
+

@@ -3,6 +3,11 @@
 Модуль не обращается к БД и к Telegram: только чистые функции от этапа слова и
 ответа пользователя. Именно поэтому его удобно покрывать юнит-тестами.
 
+Единственная зависимость «извне» — окно рассылки
+(:class:`services.slots.WindowBounds`): рассчитанный срок повторения передаётся
+:func:`services.slots.align_to_window`, чтобы слово всегда можно было показать
+внутри окна (см. :func:`apply_answer`).
+
 Таблица этапов (раздел 6 ТЗ):
 
 ======  =============================
@@ -23,6 +28,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 import config
+from services import slots
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,18 +75,37 @@ def next_review_datetime(stage: int, now_utc: datetime) -> datetime:
     return now_utc + timedelta(days=interval_days(stage))
 
 
+def _due_at(moment: datetime, window: slots.WindowBounds | None) -> datetime:
+    """Срок повторения внутри окна рассылки (см. :func:`apply_answer`)."""
+    if window is None:
+        return moment
+    return slots.align_to_window(window, moment)
+
+
 def refresh_interval_days() -> int:
     """Интервал освежения выученных слов (этап 6)."""
     return interval_days(config.SRS_MAX_STAGE)
 
 
-def apply_answer(state: SrsState, answer: str, now_utc: datetime) -> SrsState:
+def apply_answer(
+    state: SrsState,
+    answer: str,
+    now_utc: datetime,
+    *,
+    window: slots.WindowBounds | None = None,
+) -> SrsState:
     """Применяет ответ пользователя и возвращает новое состояние слова.
 
     * «Знаю» — этап увеличивается на 1 (не выше 6), интервал берётся из таблицы;
     * «Не знаю» — этап сбрасывается в 0, слово возвращается в ближайшее окно,
       в том числе если это было освежение выученного слова.
 
+    :param window: окно рассылки пользователя
+        (:class:`services.slots.WindowBounds`). Если оно задано, рассчитанный срок
+        сдвигается внутрь окна (:func:`services.slots.align_to_window`): отвечают и
+        после закрытия окна, а слово со сроком «за окном» не может показать ни один
+        слот — план дня считал его не отданным, а расписание его не находило
+        (в базе 09.10.2026 «план дня 2», «отправлено 0»).
     :raises ValueError: если ответ не из :data:`config.ANSWERS`.
     """
     if answer not in config.ANSWERS:
@@ -92,7 +117,7 @@ def apply_answer(state: SrsState, answer: str, now_utc: datetime) -> SrsState:
             state,
             stage=stage,
             status=status_for_stage(stage),
-            next_review_at=next_review_datetime(stage, now_utc),
+            next_review_at=_due_at(next_review_datetime(stage, now_utc), window),
             times_correct=state.times_correct + 1,
             is_refresh=False,
         )
@@ -101,7 +126,9 @@ def apply_answer(state: SrsState, answer: str, now_utc: datetime) -> SrsState:
         state,
         stage=config.SRS_FIRST_STAGE,
         status=config.STATUS_LEARNING,
-        next_review_at=next_review_datetime(config.SRS_FIRST_STAGE, now_utc),
+        next_review_at=_due_at(
+            next_review_datetime(config.SRS_FIRST_STAGE, now_utc), window
+        ),
         times_wrong=state.times_wrong + 1,
         is_refresh=False,
     )

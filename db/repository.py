@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TypeVar
 
-from sqlalchemy import ColumnElement, Subquery, and_, func, or_, select
+from sqlalchemy import ColumnElement, Subquery, and_, case, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -431,6 +431,117 @@ def sent_today_subquery(user: User, since: datetime) -> Subquery:
     )
 
 
+def queue_rank(day_start: datetime | None) -> ColumnElement[int]:
+    """Ранг ступени очереди слов (раздел «Порядок очереди» ТЗ).
+
+    Чем меньше ранг, тем раньше слово выбирается (см.
+    :data:`config.QUEUE_RANK_LEARNED` и соседние константы):
+
+    * освежение выученного (этап 6) — ``config.QUEUE_RANK_LEARNED``: такое слово
+      приходит отдельным сообщением и дневного плана не занимает;
+    * этапы 5…1 — ``config.QUEUE_RANK_STAGE_BASE`` − этап (15…19): чем выше этап,
+      тем важнее повтор, поэтому порядок строго 5 → 4 → … → 1;
+    * этап 0 «не сегодня» — ``config.QUEUE_RANK_STAGE_ZERO_NOT_TODAY``;
+    * новое слово — ``config.QUEUE_RANK_NEW_WORD``: ранга в SQL у него нет (новые
+      слова живут отдельным запросом :func:`fetch_new_words`), ступень сравнивается
+      в :func:`services.word_selector.select_main_word`;
+    * этап 0 «сегодня» — ``config.QUEUE_RANK_STAGE_ZERO_TODAY``: самый последний,
+      иначе ответ «не знаю» возвращал бы то же слово в следующий же слот.
+
+    :param day_start: начало местных суток пользователя
+        (:func:`services.slots.local_day_start_utc`); ``None`` означает, что
+        «сегодня» в выборке неизвестно — тогда все слова этапа 0 считаются «не
+        сегодня».
+    """
+    if day_start is None:
+        reviewed_today: ColumnElement[bool] = false()
+    else:
+        reviewed_today = and_(
+            UserWord.last_reviewed_at.is_not(None),
+            UserWord.last_reviewed_at >= day_start,
+        )
+    return case(
+        (UserWord.status == config.STATUS_LEARNED, config.QUEUE_RANK_LEARNED),
+        (
+            UserWord.stage > config.SRS_FIRST_STAGE,
+            config.QUEUE_RANK_STAGE_BASE - UserWord.stage,
+        ),
+        (reviewed_today, config.QUEUE_RANK_STAGE_ZERO_TODAY),
+        else_=config.QUEUE_RANK_STAGE_ZERO_NOT_TODAY,
+    )
+
+
+async def fetch_queue_words(
+    session: AsyncSession,
+    user: User,
+    *,
+    due_until: datetime,
+    limit: int,
+    day_start: datetime | None = None,
+    pos_values: Sequence[str] = (),
+    exclude_word_ids: Sequence[int] = (),
+    learned: bool = False,
+) -> Sequence[UserWord]:
+    """Очередь слов пользователя по ступеням (см. :func:`queue_rank`).
+
+    Одна и та же очередь обслуживает расписание и ручной запрос «дай слово»:
+    разница только в границе ``due_until``. Расписание показывает то, что пора
+    показать сейчас, кнопка — весь оставшийся план дня (до конца местных суток,
+    :func:`services.slots.local_day_end_utc`), поэтому день можно пройти досрочно,
+    а расписание после этого уже не присылает пройденное.
+
+    :param due_until: граница «пора показать»: у расписания — «сейчас», у запроса
+        «дай слово» — конец местных суток пользователя.
+    :param day_start: начало местных суток пользователя. Одновременно и условие
+        «слово снова ждёт отправки» (:func:`waiting_for_repeat_condition`), и
+        разделитель ступеней этапа 0 в :func:`queue_rank` — так очередь и план дня
+        не могут разойтись (см. :func:`count_pending_review_user_words`).
+    :param learned: ``True`` — очередь освежения: выученные слова (этап 6), у
+        которых подошёл срок. Порядок — кого дольше не показывали
+        (``last_sent_at``), затем по сроку повторения.
+    :param exclude_word_ids: слова, которые сейчас показывать не нужно.
+    """
+    last_sent = last_sent_subquery(user)
+    stmt = (
+        select(UserWord)
+        .join(Word, Word.id == UserWord.word_id)
+        .outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id)
+        .where(
+            UserWord.user_id == user.id,
+            UserWord.next_review_at.is_not(None),
+            UserWord.next_review_at <= due_until,
+        )
+        .limit(limit)
+        .options(joinedload(UserWord.word))
+    )
+    if learned:
+        stmt = stmt.where(UserWord.status == config.STATUS_LEARNED).order_by(
+            last_sent.c.last_sent_at.asc().nulls_first(),
+            UserWord.next_review_at.asc(),
+            UserWord.id.asc(),
+        )
+    else:
+        stmt = stmt.where(
+            UserWord.status == config.STATUS_LEARNING,
+            UserWord.is_refresh.is_(False),
+        )
+        if day_start is not None:
+            stmt = stmt.where(waiting_for_repeat_condition(last_sent, day_start))
+        stmt = stmt.order_by(
+            queue_rank(day_start).asc(),
+            UserWord.next_review_at.asc(),
+            UserWord.last_reviewed_at.asc(),
+            UserWord.id.asc(),
+        )
+    if exclude_word_ids:
+        stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
 async def fetch_due_user_words(
     session: AsyncSession,
     user: User,
@@ -440,11 +551,17 @@ async def fetch_due_user_words(
     exclude_word_ids: Sequence[int] = (),
     not_shown_since: datetime | None = None,
 ) -> Sequence[UserWord]:
-    """Слова в статусе «изучается», у которых наступила дата повторения.
+    """Слова «в изучении», у которых наступил срок повторения (``до now``).
 
-    Самые просроченные идут первыми; при равном сроке вперёд попадают те, что
-    дольше ждали показа (``last_reviewed_at``), поэтому слово, на которое только
-    что ответили «не знаю» (этап 0), не вытесняет остальные.
+    Обёртка над общей очередью (:func:`fetch_queue_words`): ``not_shown_since``
+    здесь — начало местных суток пользователя
+    (:func:`services.slots.local_day_start_utc`), поэтому оно же задаёт ступень
+    «этап 0 не сегодня / сегодня» в :func:`queue_rank`.
+
+    Порядок — по ступеням (:func:`queue_rank`), внутри ступени первыми идут самые
+    просроченные; при равном сроке вперёд попадают те, что дольше ждали показа
+    (``last_reviewed_at``), поэтому слово, на которое только что ответили «не знаю»
+    (этап 0), не вытесняет остальные.
 
     :param exclude_word_ids: слова, которые сейчас показывать не нужно (например,
         уже отправленные карточки без ответа при ручном запросе ``/word``).
@@ -455,36 +572,15 @@ async def fetch_due_user_words(
         повторения, которых сегодня ещё не было, и только потом новое слово, а
         карточка, которая висит в чате без ответа, второй раз не приходит.
     """
-    stmt = (
-        select(UserWord)
-        .join(Word, Word.id == UserWord.word_id)
-        .where(
-            UserWord.user_id == user.id,
-            UserWord.status == config.STATUS_LEARNING,
-            UserWord.is_refresh.is_(False),
-            UserWord.next_review_at.is_not(None),
-            UserWord.next_review_at <= now,
-        )
-        .order_by(
-            UserWord.next_review_at.asc(),
-            UserWord.last_reviewed_at.asc(),
-            UserWord.id.asc(),
-        )
-        .limit(limit)
-        .options(joinedload(UserWord.word))
+    return await fetch_queue_words(
+        session,
+        user,
+        due_until=now,
+        limit=limit,
+        day_start=not_shown_since,
+        pos_values=pos_values,
+        exclude_word_ids=exclude_word_ids,
     )
-    if not_shown_since is not None:
-        last_sent = last_sent_subquery(user)
-        stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
-            waiting_for_repeat_condition(last_sent, not_shown_since)
-        )
-    if exclude_word_ids:
-        stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
-    condition = build_pos_filter_condition(pos_values)
-    if condition is not None:
-        stmt = stmt.where(condition)
-    result = await session.execute(stmt)
-    return result.scalars().all()
 
 
 async def fetch_repeat_user_words(
@@ -498,16 +594,16 @@ async def fetch_repeat_user_words(
 ) -> Sequence[UserWord]:
     """Слова дня, которые можно пройти **заново** вручную.
 
-    В выборку попадают слова «в изучении», у которых с момента ``since`` (начало
-    местных суток пользователя) ровно одна отправка и на неё уже ответили. Это и
-    есть «слова дня»: кнопка «🎲 Слово» отдаёт их, когда план дня уже выполнен, —
-    чтобы день можно было повторить целиком (см.
-    :func:`services.word_selector.select_repeat_word`).
+    В выборку попадают слова «в изучении», отправленные и уже отвеченные с момента
+    ``since`` (начало местных суток пользователя), у которых лимит показов за сутки
+    (``config.ON_DEMAND_MAX_SENDS_PER_DAY``) ещё не исчерпан. Это и есть «слова дня»:
+    кнопка «🎲 Слово» отдаёт их, когда план дня уже выполнен, — чтобы день можно было
+    повторить целиком (см. :func:`services.word_selector.select_repeat_word`).
 
     Карточка без ответа не подходит: в чате оказались бы две одинаковые карточки, а
-    прогресс от второй отправки не меняется. Слова, приходившие сегодня дважды, тоже
-    не подходят: общее ограничение ``config.ON_DEMAND_MAX_SENDS_PER_DAY`` не даёт
-    ручному запросу ходить по кругу одного слова.
+    прогресс от второй отправки не меняется. Слово, исчерпавшее лимит показов за
+    сутки, не подходит тоже (``sent_count < config.ON_DEMAND_MAX_SENDS_PER_DAY``):
+    иначе ручной запрос ходил бы по кругу одного слова.
 
     :param exclude_word_ids: слова, которые сейчас показывать не нужно
         (см. :func:`services.word_selector.on_demand_exclusions`).
@@ -521,8 +617,8 @@ async def fetch_repeat_user_words(
             UserWord.user_id == user.id,
             UserWord.status == config.STATUS_LEARNING,
             UserWord.is_refresh.is_(False),
-            sent.c.sent_count == 1,
-            sent.c.answered_count == 1,
+            sent.c.sent_count < config.ON_DEMAND_MAX_SENDS_PER_DAY,
+            sent.c.answered_count == sent.c.sent_count,
         )
         # Порядок показа сегодня: слова дня идут так, как приходили.
         .order_by(sent.c.first_sent_at.asc(), UserWord.id.asc())
@@ -587,36 +683,22 @@ async def fetch_refresh_user_words(
 ) -> Sequence[UserWord]:
     """Выученные слова, у которых подошёл срок освежения (этап 6, 90 дней).
 
+    Обёртка над общей очередью (:func:`fetch_queue_words`): освежение идёт
+    отдельным сообщением, дневного плана не занимает и лимитом показов за сутки не
+    ограничено.
+
     :param exclude_word_ids: слова, которые сейчас показывать не нужно (см.
         :func:`fetch_due_user_words`).
     """
-    last_sent = last_sent_subquery(user)
-
-    stmt = (
-        select(UserWord)
-        .join(Word, Word.id == UserWord.word_id)
-        .outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id)
-        .where(
-            UserWord.user_id == user.id,
-            UserWord.status == config.STATUS_LEARNED,
-            UserWord.next_review_at.is_not(None),
-            UserWord.next_review_at <= now,
-        )
-        .order_by(
-            last_sent.c.last_sent_at.asc().nulls_first(),
-            UserWord.next_review_at.asc(),
-            UserWord.id.asc(),
-        )
-        .limit(limit)
-        .options(joinedload(UserWord.word))
+    return await fetch_queue_words(
+        session,
+        user,
+        due_until=now,
+        limit=limit,
+        pos_values=pos_values,
+        exclude_word_ids=exclude_word_ids,
+        learned=True,
     )
-    if exclude_word_ids:
-        stmt = stmt.where(UserWord.word_id.not_in(exclude_word_ids))
-    condition = build_pos_filter_condition(pos_values)
-    if condition is not None:
-        stmt = stmt.where(condition)
-    result = await session.execute(stmt)
-    return result.scalars().all()
 
 
 async def fetch_shown_word_ids_since(
@@ -819,6 +901,78 @@ async def count_pending_review_user_words(
         stmt = stmt.where(condition)
     result = await session.execute(stmt)
     return int(result.scalar_one())
+
+
+async def count_due_queue_by_stage(
+    session: AsyncSession,
+    user: User,
+    until: datetime,
+    *,
+    not_shown_since: datetime | None = None,
+    pos_values: Sequence[str] = (),
+) -> dict[int, int]:
+    """Сколько слов очереди ждёт показа на каждом этапе (диагностика пустого слота).
+
+    Считается ровно то, из чего выбирает :func:`fetch_queue_words`, но без
+    ограничения по числу строк и с разбивкой по этапам. По этой карте видно, почему
+    слот остался пустым: например, «этап 0 — 2», хотя обе карточки висят в чате без
+    ответа (см. :func:`services.plan.describe_empty_queue`).
+
+    :param until: граница «пора показать» (см. :func:`fetch_queue_words`).
+    :param not_shown_since: начало местных суток пользователя — то же условие
+        «слово снова ждёт отправки», что и у очереди.
+    """
+    stmt = (
+        select(UserWord.stage, func.count())
+        .join(Word, Word.id == UserWord.word_id)
+        .where(
+            UserWord.user_id == user.id,
+            UserWord.next_review_at.is_not(None),
+            UserWord.next_review_at <= until,
+        )
+        .group_by(UserWord.stage)
+    )
+    if not_shown_since is not None:
+        last_sent = last_sent_subquery(user)
+        stmt = stmt.outerjoin(last_sent, last_sent.c.word_id == UserWord.word_id).where(
+            waiting_for_repeat_condition(last_sent, not_shown_since)
+        )
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
+    return {int(stage): int(count) for stage, count in result.all()}
+
+
+async def fetch_nearest_review_at(
+    session: AsyncSession,
+    user: User,
+    *,
+    since: datetime,
+    pos_values: Sequence[str] = (),
+) -> datetime | None:
+    """Ближайший срок повторения слов «в изучении» позже ``since``.
+
+    Нужен для диагностики пустого слота: если очередь пуста, а план дня непуст,
+    слово обычно ждёт срока, который наступает **позже** окна рассылки, — раньше
+    это было не видно ни в логах, ни в ``/stats`` (см.
+    :func:`services.plan.describe_empty_queue`).
+    """
+    stmt = (
+        select(func.min(UserWord.next_review_at))
+        .join(Word, Word.id == UserWord.word_id)
+        .where(
+            UserWord.user_id == user.id,
+            UserWord.status == config.STATUS_LEARNING,
+            UserWord.next_review_at.is_not(None),
+            UserWord.next_review_at > since,
+        )
+    )
+    condition = build_pos_filter_condition(pos_values)
+    if condition is not None:
+        stmt = stmt.where(condition)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def get_or_create_user_word(session: AsyncSession, user_id: int, word_id: int) -> UserWord:

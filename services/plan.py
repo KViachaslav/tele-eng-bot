@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db import repository
 from db.models import User
 from services import slots
-from services.word_selector import new_words_allowed
+from services.word_selector import hanging_card_word_ids, new_words_allowed
 
 
 @dataclass(slots=True)
@@ -92,6 +92,65 @@ async def planned_words_left(session: AsyncSession, user: User, day_start: datet
     if not await repository.fetch_new_words(session, user, 1, user.pos_filter_values):
         return 0
     return left
+
+
+async def describe_empty_queue(session: AsyncSession, user: User, now: datetime) -> str:
+    """Строка для лога: почему слот остался без слова (см. ``services.scheduler``).
+
+    Пустой слот — самая дорогая ошибка рассылки: расписание сработало, а слово не
+    ушло, и в логе видно только «слов отправлено 0». Поэтому сюда попадает всё, что
+    объясняет причину:
+
+    * план дня и его состав (новые слова и повторения) — по нему видно расхождение
+      «план дня 2, слов отправлено 0» (в базе 09.10.2026 слова ждали 18:08 и 18:10
+      при окне до 18:00, то есть попадали в план дня, но не в окно рассылки);
+    * очередь по этапам (:func:`db.repository.count_due_queue_by_stage`) — ровно
+      то, из чего выбирает рассылка, вместе с лимитом показов за сутки и фильтром
+      частей речи;
+    * сколько карточек висит в чате без ответа (их очередь пропускает);
+    * ближайший срок повторения, который ещё не наступил, — обычно причина пустого
+      слота именно в нём.
+
+    Возвращается одна строка: её пишет планировщик, когда ничего не отправил
+    (:meth:`services.scheduler.SchedulerService._deliver_due_word`).
+    """
+    day_start = slots.local_day_start_utc(user, now)
+    day_end = slots.local_day_end_utc(user, now)
+    planned = await planned_words_left(session, user, day_start)
+    reviews = await repository.count_pending_review_user_words(
+        session,
+        user,
+        day_end,
+        not_shown_since=day_start,
+        pos_values=user.pos_filter_values,
+    )
+    by_stage = await repository.count_due_queue_by_stage(
+        session,
+        user,
+        day_end,
+        not_shown_since=day_start,
+        pos_values=user.pos_filter_values,
+    )
+    hanging = await hanging_card_word_ids(session, user, now)
+    nearest = await repository.fetch_nearest_review_at(
+        session, user, since=now, pos_values=user.pos_filter_values
+    )
+    stages = ", ".join(
+        f"этап {stage} — {count}" for stage, count in sorted(by_stage.items())
+    ) or "пусто"
+    if nearest is None:
+        nearest_text = "нет"
+    else:
+        nearest_text = (
+            f"{slots.local_date(user, nearest).strftime('%d.%m')} "
+            f"{slots.local_time_string(user, nearest)}"
+        )
+    return (
+        f"план дня {planned + reviews} (новых {planned}, повторений {reviews}), "
+        f"очередь до конца суток: {stages}, висящих карточек {len(hanging)}, "
+        f"ближайший срок {nearest_text}, окно {user.window_start}–{user.window_end}, "
+        f"сейчас {slots.local_time_string(user, now)}"
+    )
 
 
 async def upcoming_plan(

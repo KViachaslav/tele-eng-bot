@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 from db import repository
 from db.models import DeliveryLog, User, UserWord
-from services import word_selector
+from services import slots, word_selector
 
 
 async def put_in_learning(
@@ -374,3 +374,135 @@ async def test_words_shown_today_false_without_deliveries(session, user, words, 
     await show_word(session, user, words[0].id, now, hours_ago=30)
 
     assert await word_selector.words_shown_today(session, user, now) is False
+
+
+# ---------------------------------------------------------------------------
+# Горизонт слота и кнопки: одни и те же «сегодня» и очередь
+# ---------------------------------------------------------------------------
+async def test_slot_word_due_later_today_is_sendable(session, user, words, now) -> None:
+    """Расписание отдаёт слово плана дня, даже если срок наступит позже «сейчас».
+
+    Регрессия 09.10.2026: план дня считал слова до конца местных суток, а слот выбирал
+    только «срок <= сейчас». Слова ждали 18:08 и 18:10 при окне до 18:00 — в плане дня
+    они были, а ни один слот их не отправлял: «план дня 2», «отправлено 0».
+    """
+    day_end = slots.local_day_end_utc(user, now)
+    progress = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=day_end - timedelta(minutes=1),
+        last_reviewed_at=now - timedelta(days=1),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+    selected = await word_selector.select_main_word(session, user, now)
+
+    assert selected is not None
+    assert selected.word.word == "quickly"
+
+
+async def test_plan_word_and_slot_word_come_from_one_queue(session, user, words, now) -> None:
+    """Кнопка «🎲 Слово» и расписание выбирают одно и то же слово.
+
+    Очередь и горизонт у них общие (см. :func:`select_plan_word`), иначе кнопка
+    отдавала бы слова, которых расписание не пришлёт, и наоборот.
+    """
+    day_end = slots.local_day_end_utc(user, now)
+    progress = await repository.get_or_create_user_word(session, user.id, words[2].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=2,
+        status=config.STATUS_LEARNING,
+        next_review_at=day_end - timedelta(minutes=5),
+        last_reviewed_at=now - timedelta(days=3),
+        times_correct=2,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+    planned = await word_selector.select_plan_word(session, user, now)
+    scheduled = await word_selector.select_main_word(session, user, now)
+
+    assert planned is not None and scheduled is not None
+    assert planned.word.id == scheduled.word.id == words[2].id
+
+
+async def test_queue_priority_follows_stages(session, user, words, now) -> None:
+    """Ступени очереди: этап 5 → этап 1 → этап 0 «не сегодня».
+
+    Порядок — из ТЗ («Порядок очереди»): чем выше этап, тем важнее повтор.
+    """
+    await put_in_learning(session, user.id, words[0].id, now, hours_ago=30)  # этап 0, не сегодня
+    await put_in_learning(session, user.id, words[1].id, now, hours_ago=30)
+    low = await repository.get_or_create_user_word(session, user.id, words[1].id)
+    await repository.save_user_word(
+        session,
+        low,
+        stage=1,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(minutes=5),
+        last_reviewed_at=now - timedelta(hours=30),
+        times_correct=1,
+        times_wrong=0,
+        is_refresh=False,
+    )
+    high = await repository.get_or_create_user_word(session, user.id, words[2].id)
+    await repository.save_user_word(
+        session,
+        high,
+        stage=5,
+        status=config.STATUS_LEARNING,
+        next_review_at=now - timedelta(days=1),
+        last_reviewed_at=now - timedelta(hours=40),
+        times_correct=5,
+        times_wrong=0,
+        is_refresh=False,
+    )
+
+    selected = await word_selector.select_main_word(session, user, now)
+
+    # Пятый этап важнее первого, хотя срок наступил у обоих.
+    assert selected is not None
+    assert selected.word.word == "curious"
+
+
+async def test_stage_zero_shown_today_goes_after_new_word(session, user, words, now) -> None:
+    """Слово этапа 0, отвеченное сегодня, не вытесняет новое слово.
+
+    Без этой ступени ответ «не знаю» возвращал бы то же слово в следующий же слот
+    (срок наступает сразу), и новые слова не приходили бы вовсе.
+    """
+    progress = await put_in_learning(session, user.id, words[0].id, now, hours_ago=2)
+    delivery = await show_word(session, user, words[0].id, now, hours_ago=1)
+    await answer_dont_know(session, progress, delivery, now - timedelta(minutes=30))
+
+    selected = await word_selector.select_main_word(session, user, now)
+
+    assert selected is not None
+    assert selected.user_word is None  # приходит новое слово, а не отвеченное «яблоко»
+
+
+async def test_stage_zero_shown_today_is_returned_when_nothing_else(session, user, words, now) -> None:
+    """Когда других слов нет, слово этапа 0 «сегодня» всё же отдаётся.
+
+    Оно занимает пункт плана дня, поэтому молчать о нём нельзя: план перестал бы
+    убывать от отправок (см. :func:`select_main_word`).
+    """
+    await repository.update_user(session, user, learning_limit=3)
+    for word in words:
+        progress = await put_in_learning(session, user.id, word.id, now, hours_ago=2)
+        delivery = await show_word(session, user, word.id, now, hours_ago=1)
+        await answer_dont_know(session, progress, delivery, now - timedelta(minutes=30))
+
+    selected = await word_selector.select_main_word(session, user, now)
+
+    assert selected is not None
+    assert selected.user_word is not None
+    assert selected.user_word.stage == config.SRS_FIRST_STAGE
+

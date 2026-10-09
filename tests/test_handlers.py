@@ -1690,3 +1690,48 @@ async def test_on_forecast_shows_plan_for_upcoming_days(
         button.text for row in bot.edits[-1]["reply_markup"].inline_keyboard for button in row
     ] == [texts.BTN_BACK]
     assert len(alerts_from(bot)) == 1
+
+
+async def test_on_demand_plan_pass_ignores_daily_ceiling(session, user, words) -> None:
+    """Кнопка отдаёт слово плана дня, даже если лимит показов за сутки исчерпан.
+
+    Регрессия: лимит показов за сутки отсекал и слова плана дня, поэтому кнопка
+    отвечала «план на сегодня выполнен», хотя в плане оставались слова — они уже
+    приходили и снова ждали отправки. Лимит ограничивает только повтор дня
+    (см. :func:`services.word_selector.on_demand_exclusions`).
+    """
+    moment = utcnow()
+    day_start = slots.local_day_start_utc(user, moment)
+    await repository.update_user(session, user, words_per_day=1, learning_limit=1)
+    progress = await repository.get_or_create_user_word(session, user.id, words[0].id)
+    await repository.save_user_word(
+        session,
+        progress,
+        stage=config.SRS_FIRST_STAGE,
+        status=config.STATUS_LEARNING,
+        next_review_at=moment,
+        last_reviewed_at=moment,
+        times_correct=0,
+        times_wrong=2,
+        is_refresh=False,
+    )
+    # Обе карточки пришли сегодня и получили ответ «не знаю» — лимит показов исчерпан.
+    first = await repository.create_delivery(session, user.id, words[0].id, sent_at=day_start)
+    await repository.mark_delivery_answered(
+        session, first, config.ANSWER_DONT_KNOW, answered_at=day_start
+    )
+    second = await repository.create_delivery(
+        session, user.id, words[0].id, sent_at=moment - timedelta(minutes=1)
+    )
+    await repository.mark_delivery_answered(
+        session, second, config.ANSWER_DONT_KNOW, answered_at=moment
+    )
+    at_ceiling = await repository.fetch_word_ids_sent_at_least(
+        session, user, since=day_start, count=config.ON_DEMAND_MAX_SENDS_PER_DAY
+    )
+    assert words[0].id in at_ceiling
+    bot = FakeBot()
+
+    assert await delivery.deliver_on_demand(bot, session, user) is True
+    assert word_ids_from(bot) == [words[0].id]
+

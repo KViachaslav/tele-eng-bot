@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -325,3 +326,65 @@ def test_local_day_start_and_end_come_from_bounds() -> None:
 
     assert slots.local_day_start_utc(moscow, now) == start
     assert slots.local_day_end_utc(moscow, now) == end
+
+
+# ---------------------------------------------------------------------------
+# Сдвиг срока повторения внутрь окна (``services.srs.apply_answer``)
+# ---------------------------------------------------------------------------
+def test_window_bounds_come_from_user_settings() -> None:
+    """``WindowBounds.of`` берёт пояс и границы окна из настроек пользователя."""
+    user = make_user(timezone_name="Europe/Moscow", window_start="09:00", window_end="18:00")
+
+    bounds = slots.WindowBounds.of(user)
+
+    moscow = ZoneInfo("Europe/Moscow")
+    assert bounds.start == time(9, 0)
+    assert bounds.end == time(18, 0)
+    assert bounds.open_at(date(2026, 1, 15)) == datetime(2026, 1, 15, 9, 0, tzinfo=moscow)
+    assert bounds.close_at(date(2026, 1, 15)) == datetime(2026, 1, 15, 18, 0, tzinfo=moscow)
+
+
+def test_window_bounds_close_at_midnight_ends_the_day() -> None:
+    """``00:00`` в конце окна — конец суток: закрытие переносится на полночь."""
+    user = make_user(timezone_name="UTC", window_start="12:00", window_end="00:00")
+
+    bounds = slots.WindowBounds.of(user)
+
+    assert bounds.close_at(date(2026, 1, 15)) == datetime(2026, 1, 16, 0, 0, tzinfo=timezone.utc)
+
+
+def test_align_to_window_keeps_moment_inside_window() -> None:
+    """Срок внутри окна не меняется (в БД он хранится как наивный UTC)."""
+    user = make_user(timezone_name="Europe/Moscow", window_start="09:00", window_end="18:00")
+    bounds = slots.WindowBounds.of(user)
+    # 09:30 UTC — это 12:30 по Москве, внутри окна 09:00–18:00.
+    moment = datetime(2026, 1, 15, 9, 30)
+
+    assert slots.align_to_window(bounds, moment) == moment
+
+
+def test_align_to_window_moves_review_after_close_to_window_open() -> None:
+    """Срок за закрытием окна переносится на открытие окна тех же суток.
+
+    Регрессия 09.10.2026: ответ пришёл в 18:08 по Москве (окно до 18:00), поэтому
+    слово ждало срока 18:08, а рассылка работает только до 18:00 — слово стояло в
+    плане дня и не приходило: «план дня 2», «отправлено 0»
+    (см. :func:`services.srs.apply_answer`).
+    """
+    user = make_user(timezone_name="Europe/Moscow", window_start="09:00", window_end="18:00")
+    bounds = slots.WindowBounds.of(user)
+    # 15:08 UTC — это 18:08 по Москве, уже за закрытием окна.
+    late = datetime(2026, 1, 15, 15, 8)
+
+    assert slots.align_to_window(bounds, late) == datetime(2026, 1, 15, 6, 0)
+
+
+def test_align_to_window_moves_review_before_open_forward() -> None:
+    """Срок раньше открытия окна сдвигается вперёд — на открытие тех же суток."""
+    user = make_user(timezone_name="Europe/Moscow", window_start="12:00", window_end="18:00")
+    bounds = slots.WindowBounds.of(user)
+    # 05:00 UTC — это 08:00 по Москве, окно откроется только в 12:00.
+    early = datetime(2026, 1, 15, 5, 0)
+
+    assert slots.align_to_window(bounds, early) == datetime(2026, 1, 15, 9, 0)
+
